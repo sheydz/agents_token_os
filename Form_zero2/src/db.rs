@@ -1639,6 +1639,19 @@ impl Database {
         Ok(program)
     }
 
+    pub async fn clear_program_process_context_lengths(
+        &self,
+        program_run_id: &str,
+    ) -> Result<ProgramRow> {
+        let (program, ()) = self
+            .update_program_plan_state_locked(program_run_id, move |plan_state| {
+                plan_state.process_context_lengths.clear();
+                Ok(())
+            })
+            .await?;
+        Ok(program)
+    }
+
     pub(crate) async fn refresh_program_process_context_length(
         &self,
         program_run_id: &str,

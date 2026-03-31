@@ -4089,6 +4089,9 @@ impl RuntimeEngine {
             .values()
             .copied()
             .sum::<usize>();
+        self.db
+            .clear_program_process_context_lengths(&binding.program_run_id)
+            .await?;
         let threshold = self.global_reprompt_threshold();
 
         let active_prompts = self
