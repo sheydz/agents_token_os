@@ -1,6 +1,5 @@
 # Ignore all top-level directories except Form_zero.
 /*/
-!/Form_zero/
 !/gepa_zero/
 !/From_zero2/
 
