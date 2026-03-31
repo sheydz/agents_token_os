@@ -1,0 +1,33 @@
+[package]
+name = "form_zero"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src copy/lib.rs"
+
+[[bin]]
+name = "form_zero"
+path = "src copy/main.rs"
+
+[features]
+default = []
+hardware = ["dep:tokio-serial"]
+probe = ["dep:probe-rs"]
+peripheral-rpi = ["dep:rppal"]
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures-util = "0.3"
+probe-rs = { version = "0.31", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rppal = { version = "0.17", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.44", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+tokio-serial = { version = "5", default-features = false, optional = true }
+uuid = { version = "1.8", features = ["serde", "v4"] }

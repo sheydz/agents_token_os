@@ -1,7 +1,7 @@
 # Ignore all top-level directories except Form_zero.
 /*/
 !/gepa_zero/
-!/From_zero2/
+!Form_zero2
 
 # Ignore Finder metadata.
 .DS_Store
