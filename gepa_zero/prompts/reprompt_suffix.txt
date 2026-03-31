@@ -1,0 +1,12 @@
+现在进入 reprompt 模式。
+请根据“当前任务消息网络 + 所有进入过优化器视野的事件 + 平均默契分演化”，一次性重写全部 agent 的前缀提示词。
+这是整组 agent 的横向更新，不是单个 agent 的局部修补。
+输出 schema：
+{
+  "agent_prompts": [
+    {
+      "agent_id": "agent id",
+      "prompt": "该 agent 的完整新前缀提示词"
+    }
+  ]
+}

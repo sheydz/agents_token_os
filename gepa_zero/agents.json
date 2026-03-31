@@ -1,0 +1,12 @@
+[
+  {
+    "agent_id": "master",
+    "prompt_file": "prompts/master_system_prompt.txt",
+    "tools": ["send_message", "search_menu_repository"]
+  },
+  {
+    "agent_id": "apprentice",
+    "prompt_file": "prompts/apprentice_system_prompt.txt",
+    "tools": ["send_message", "search_ingredient_repository"]
+  }
+]
