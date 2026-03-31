@@ -21,26 +21,29 @@ use crate::{
     db::Database,
     external_tools::ExternalToolRegistry,
     models::{
-        approximate_token_count, default_program_slot_state, merge_patch,
+        approximate_runtime_context_tokens, approximate_token_count, default_program_slot_state,
+        merge_patch,
         monitor_trigger_entries_from_value, with_runtime_state, DeliveryAction, HardwareStep,
         MessageKind, MessageSourceKind, MonitorTriggerEntry, MonitorTriggerEvent, OwnerKind,
         ProcessInstanceRow, ProcessPromptRow, ProcessRuntimeBinding, ProgramProcessBindingRow,
-        QueueBatchInfo, QueueEnvelope, ResultTarget, RuntimeHead, SegmentRow, StepKind, TaskStep,
+        QueueBatchInfo, QueueEnvelope, ResultTarget, RuntimeContextLayer,
+        RuntimeContextMessage, RuntimeContextRole, RuntimeHead, SegmentRow, StepKind, TaskStep,
         HIDDEN_OPTIMIZER_SLOT_NAME, HIDDEN_SCORE_JUDGE_SLOT_NAME,
     },
     peripherals::{build_external_tool_registry, peripherals_config_from_env, PeripheralsConfig},
     provider::{default_provider_from_env, ProviderChunk, ProviderMessage, StreamingProvider},
     tools::{
-        blacklist_blocks_message, default_deadline_ms, extract_tool_guide,
-        target_selector_from_value, tool_finished_metadata, tool_requires_guide,
-        tool_requires_provider, tool_result_patch, upsert_blacklist_entry, BlacklistEntry,
+        blacklist_blocks_message, default_deadline_ms, target_selector_from_value,
+        tool_finished_metadata, tool_requires_provider, tool_result_patch,
+        upsert_blacklist_entry, BlacklistEntry,
         HardwareOperationRegistry, ToolRegistry, ToolRunRegistry, HARDWARE_OP_BOARD_INFO,
         HARDWARE_OP_DEVICE_CAPABILITIES, HARDWARE_OP_FLASH_FIRMWARE, HARDWARE_OP_GPIO_READ,
         HARDWARE_OP_GPIO_WRITE, HARDWARE_OP_PROBE_READ_MEMORY, HARDWARE_OP_SERIAL_QUERY,
-        HARDWARE_OP_SERIAL_WRITE, TOOL_APPEND_OUTPUT_REF, TOOL_CREATE_PROGRAM,
+        HARDWARE_OP_SERIAL_WRITE, TOOL_ADD_PLAN, TOOL_APPEND_OUTPUT_REF, TOOL_CREATE_PROGRAM,
+        TOOL_DEL_PLAN,
         TOOL_DELETE_RESULT_ARTIFACT, TOOL_HISTORY_ANNOTATE, TOOL_HISTORY_QUERY,
-        TOOL_INSPECT_PROCESS_TABLE, TOOL_INVISIBLE_PROCESS, TOOL_MAKE_PLAN,
-        TOOL_MONITOR_EVENT_SEQUENCE, TOOL_REPAIR_PLAN, TOOL_SPAWN_BRANCH_PROCESS,
+        TOOL_INSPECT_PROCESS_TABLE, TOOL_INVISIBLE_PROCESS, TOOL_MONITOR_EVENT_SEQUENCE,
+        TOOL_SPAWN_BRANCH_PROCESS, TOOL_VIEW_PLAN,
         TOOL_SPAWN_REAL_PROCESS, TOOL_TERMINATE_PROCESS,
     },
 };
@@ -56,6 +59,7 @@ const RECEIVE_SEGMENT_KIND: &str = "receive_segment";
 const PROVIDER_STREAM_SEGMENT_KIND: &str = SEND_SEGMENT_KIND;
 const PROVIDER_STREAM_TOKENIZER: &str = "whitespace";
 const PERSISTED_FLUSH_INTERVAL_MS: u64 = 500;
+const SCORE_JUDGE_INTERVAL_MS: u64 = 10_000;
 const HIDDEN_SCORE_JUDGE_TOOL_NAME: &str = "__score_judge_call__";
 const HIDDEN_OPTIMIZER_TOOL_NAME: &str = "__optimizer_call__";
 const HIDDEN_REPROMPT_TOOL_NAME: &str = "__optimizer_reprompt__";
@@ -65,6 +69,7 @@ pub struct RuntimeConfig {
     pub error_log_path: PathBuf,
     pub provider_input_budget: usize,
     pub compaction_trigger_ratio: f32,
+    pub global_reprompt_include_hidden: bool,
     pub peripherals_config: PeripheralsConfig,
 }
 
@@ -83,6 +88,9 @@ impl Default for RuntimeConfig {
                 .and_then(|value| value.parse::<f32>().ok())
                 .filter(|value| *value > 0.0 && *value <= 1.0)
                 .unwrap_or(0.7),
+            global_reprompt_include_hidden: parse_env_bool_flag(
+                std::env::var("FORM_ZERO_GLOBAL_REPROMPT_INCLUDE_HIDDEN").ok(),
+            ),
             peripherals_config: peripherals_config_from_env(),
         }
     }
@@ -131,27 +139,9 @@ impl OpenLiveSegment {
         tokenizer: Option<String>,
         patch: Option<Value>,
     ) -> Result<()> {
-        // if let Some(segment_kind) = segment_kind {
-        //     if self.segment_kind != segment_kind {
-        //         bail!(
-        //             "segment_kind mismatch for owner {}: current={}, incoming={}",
-        //             self.owner_id,
-        //             self.segment_kind,
-        //             segment_kind
-        //         );
-        //     }
-        // }
-
         if let Some(tokenizer) = tokenizer {
             if self.content.is_empty() && self.tokenizer.is_none() {
                 self.tokenizer = Some(tokenizer);
-                // } else if self.tokenizer.as_deref() != Some(tokenizer.as_str()) {
-                //     bail!(
-                //         "tokenizer mismatch for owner {}: current={:?}, incoming={}",
-                //         self.owner_id,
-                //         self.tokenizer,
-                //         tokenizer
-                //     );
             }
         }
         let _ = segment_kind;
@@ -270,9 +260,8 @@ struct RuntimeHeadRegistry {
 #[derive(Clone)]
 struct ResidentPromptHeadState {
     owner_id: Uuid,
-    full_text: String,
-    built_all_len: usize,
-    stream_started: bool,
+    full_context: Vec<RuntimeContextMessage>,
+    open_stream_index: Option<usize>,
     dirty: bool,
     last_bootstrap_segment_seq: i64,
 }
@@ -320,7 +309,8 @@ impl ResidentPromptHeadState {
     fn as_runtime_head(&self, process_id: Uuid) -> RuntimeHead {
         RuntimeHead {
             process_id,
-            full_text: self.full_text.clone(),
+            estimated_tokens: approximate_runtime_context_tokens(&self.full_context),
+            full_context: self.full_context.clone(),
         }
     }
 }
@@ -372,15 +362,28 @@ fn append_prompt_stream_text(prompt_head: &mut ResidentPromptHeadState, content:
         return;
     }
 
-    if !prompt_head.stream_started {
-        prompt_head.full_text.push_str("\n\n[process_stream]\n");
-        prompt_head.stream_started = true;
+    if let Some(index) = prompt_head.open_stream_index {
+        if let Some(message) = prompt_head.full_context.get_mut(index) {
+            message.content.push_str(content);
+            return;
+        }
     }
-    prompt_head.full_text.push_str(content);
+
+    prompt_head.full_context.push(RuntimeContextMessage {
+        role: RuntimeContextRole::Assistant,
+        content: content.to_string(),
+        context_layer: RuntimeContextLayer::ProcessStream,
+        process_id: Some(prompt_head.owner_id),
+        slot_name: None,
+        io_kind: Some("stream".to_string()),
+    });
+    prompt_head.open_stream_index = Some(prompt_head.full_context.len() - 1);
 }
 
-fn prompt_head_stream_started(full_text: &str) -> bool {
-    full_text.contains("\n\n[process_stream]\n")
+fn last_process_stream_index(messages: &[RuntimeContextMessage]) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|message| message.context_layer == RuntimeContextLayer::ProcessStream)
 }
 
 fn history_query_value(
@@ -534,27 +537,34 @@ async fn bootstrap_prompt_head_state(
         .into_iter()
         .map(|segment| segment.to_segment_row())
         .collect::<Vec<_>>();
-    let mut full_text = sealed_head.full_text;
+    let mut full_context = sealed_head.full_context;
     for segment in &pending_segments {
-        if !prompt_head_stream_started(&full_text) {
-            full_text.push_str("\n\n[process_stream]\n");
-        }
-        full_text.push_str(&segment.content);
+        full_context.push(RuntimeContextMessage {
+            role: RuntimeContextRole::Assistant,
+            content: segment.content.clone(),
+            context_layer: RuntimeContextLayer::ProcessStream,
+            process_id: Some(process_id),
+            slot_name: None,
+            io_kind: Some("stream".to_string()),
+        });
     }
+    let mut open_stream_index = None;
     if let Some(segment) = open_live_segment.as_ref() {
-        if !prompt_head_stream_started(&full_text) {
-            full_text.push_str("\n\n[process_stream]\n");
-        }
-        full_text.push_str(&segment.content);
+        full_context.push(RuntimeContextMessage {
+            role: RuntimeContextRole::Assistant,
+            content: segment.content.clone(),
+            context_layer: RuntimeContextLayer::ProcessStream,
+            process_id: Some(process_id),
+            slot_name: None,
+            io_kind: Some("stream".to_string()),
+        });
+        open_stream_index = Some(full_context.len() - 1);
     }
 
     Ok(ResidentPromptHeadState {
         owner_id: process_id,
-        built_all_len: full_text
-            .find("\n\n[process_stream]\n")
-            .unwrap_or(full_text.len()),
-        stream_started: prompt_head_stream_started(&full_text),
-        full_text,
+        full_context,
+        open_stream_index,
         dirty: false,
         last_bootstrap_segment_seq: open_live_segment
             .as_ref()
@@ -604,6 +614,7 @@ async fn seal_resident_open_live(
 
     runtime_head.last_bootstrap_segment_seq =
         runtime_head.last_bootstrap_segment_seq.max(owner_seq);
+    runtime_head.open_stream_index = None;
     runtime_head_registry.upsert(runtime_head).await;
 }
 
@@ -709,14 +720,10 @@ fn prompt_head_from_runtime_head(
     runtime_head: &RuntimeHead,
     last_bootstrap_segment_seq: i64,
 ) -> ResidentPromptHeadState {
-    let full_text = runtime_head.full_text.clone();
     ResidentPromptHeadState {
         owner_id,
-        built_all_len: full_text
-            .find("\n\n[process_stream]\n")
-            .unwrap_or(full_text.len()),
-        stream_started: prompt_head_stream_started(&full_text),
-        full_text,
+        full_context: runtime_head.full_context.clone(),
+        open_stream_index: None,
         dirty: false,
         last_bootstrap_segment_seq,
     }
@@ -758,60 +765,13 @@ enum LiveOwnerRef {
     Ephemeral(EphemeralStreamId),
 }
 fn boundary_decision_from_signal(signal: &RuntimeSignal) -> BoundaryDecision {
-    // fn metadata_uuid(signal: &RuntimeSignal, key: &str) -> Option<Uuid> {
-    //     signal
-    //         .metadata
-    //         .as_ref()
-    //         .and_then(|value| value.get(key))
-    //         .and_then(Value::as_str)
-    //         .and_then(|value| Uuid::parse_str(value).ok())
-    // }
-
-    // fn sequence_actions_from_signal(signal: &RuntimeSignal) -> Vec<SequenceEngineAction> {
     match signal.kind {
         RuntimeSignalKind::LiveFrame => BoundaryDecision::Continue,
         RuntimeSignalKind::ForceBoundary
         | RuntimeSignalKind::ProviderCompleted
-        | RuntimeSignalKind::SendMessageCompleted => {
-            BoundaryDecision::SealNow
-            // RuntimeSignalKind::SendStarted => vec![SequenceEngineAction::SealCurrentSegment {
-            //     process_id: signal.observed_process_id,
-            // }],
-            // RuntimeSignalKind::SendCompleted => {
-            //     let mut actions = vec![SequenceEngineAction::SealCurrentSegment {
-            //         process_id: signal.observed_process_id,
-            //     }];
-            //     if let Some(target_process_id) = metadata_uuid(signal, "release_target_process_id") {
-            //         actions.push(SequenceEngineAction::ReleaseMailbox { process_id: target_process_id });
-            //     }
-            //     actions
-            // }
-            // RuntimeSignalKind::ReceiveCompleted
-            // | RuntimeSignalKind::OutputCompleted
-            // | RuntimeSignalKind::ForceInterrupted => {
-            //     let mut actions = vec![SequenceEngineAction::SealCurrentSegment {
-            //         process_id: signal.observed_process_id,
-            //     }];
-            //     if signal.kind == RuntimeSignalKind::OutputCompleted && signal.observed_stream_id.is_none()
-            //     {
-            //         actions.push(SequenceEngineAction::ReleaseMailbox {
-            //             process_id: signal.observed_process_id,
-            //         });
-            //     }
-            //     actions
-        }
+        | RuntimeSignalKind::SendMessageCompleted => BoundaryDecision::SealNow,
         RuntimeSignalKind::FlushTick => BoundaryDecision::Ignore,
         _ => BoundaryDecision::Ignore,
-        // RuntimeSignalKind::LiveFrame
-        // | RuntimeSignalKind::QueueDelivered
-        // | RuntimeSignalKind::ToolFinished
-        // | RuntimeSignalKind::ToolMaterialized
-        // | RuntimeSignalKind::ProviderCompleted
-        // | RuntimeSignalKind::ForceBoundary
-        // | RuntimeSignalKind::SendMessageCompleted
-        // | RuntimeSignalKind::ReceiveStarted
-        // | RuntimeSignalKind::SegmentSealed
-        // | RuntimeSignalKind::FlushTick => Vec::new(),
     }
 }
 
@@ -892,49 +852,6 @@ async fn append_process_segment_to_live_bus(
 
     Ok(open_live.to_segment_row())
 }
-
-// fn process_body_patch(body_subkind: &str, patch: Option<Value>) -> Option<Value> {
-//     merge_patch(
-//         patch,
-//         Some(json!({
-//             "body_subkind": body_subkind,
-//         })),
-//     )
-// }
-
-// async fn append_process_body_to_live_bus(
-//     db: &Database,
-//     live_bus_registry: &LiveBusRegistry,
-//     runtime_head_registry: &RuntimeHeadRegistry,
-//     sequence_engine: &MonitorEventSequenceEngine,
-//     process: &ProcessInstanceRow,
-//     binding: Option<&ProgramProcessBindingRow>,
-//     body_subkind: &str,
-//     content: &str,
-//     tokenizer: Option<&str>,
-//     patch: Option<Value>,
-//     executor_process_id: Option<Uuid>,
-//     tool_name: Option<&str>,
-//     tool_run_id: Option<Uuid>,
-// ) -> Result<SegmentRow> {
-//     append_process_segment_to_live_bus(
-//         db,
-//         live_bus_registry,
-//         runtime_head_registry,
-//         sequence_engine,
-//         process,
-//         binding,
-//         PROCESS_BODY_SEGMENT_KIND,
-//         content,
-//         tokenizer,
-//         process_body_patch(body_subkind, patch),
-//         executor_process_id,
-//         tool_name,
-//         tool_run_id,
-//     )
-//     .await
-// }
-
 #[derive(Debug, Clone)]
 struct ProviderStreamTarget {
     live_owner: LiveOwnerRef,
@@ -945,8 +862,6 @@ struct ProviderStreamTarget {
 
 struct ProviderGeneration {
     host: ProcessRuntimeBinding,
-    runtime_head: RuntimeHead,
-    provider_stream_target: ProviderStreamTarget,
     output: String,
 }
 
@@ -956,28 +871,112 @@ enum PromptAdoptionDecision {
     Rollback,
 }
 
-fn render_provider_user_prompt(
-    guide: Option<&str>,
-    runtime_head: &RuntimeHead,
-    task: &str,
-) -> String {
-    format!(
-        "[guide]\n{}\n\n[runtime_head]\n{}\n\n[task]\n{}",
-        guide.unwrap_or(""),
-        runtime_head.full_text,
-        task
-    )
+fn provider_message_from_context(message: &RuntimeContextMessage) -> ProviderMessage {
+    ProviderMessage {
+        role: message.role.as_provider_role().to_string(),
+        content: message.content.clone(),
+    }
 }
 
+fn render_provider_messages(
+    runtime_head: &RuntimeHead,
+    ephemeral_task: Option<ProviderMessage>,
+) -> Vec<ProviderMessage> {
+    let mut messages = runtime_head
+        .full_context
+        .iter()
+        .map(provider_message_from_context)
+        .collect::<Vec<_>>();
+    if let Some(task) = ephemeral_task {
+        messages.push(task);
+    }
+    messages
+}
+
+fn parse_mean_score_line(line: &str) -> Option<f64> {
+    line.strip_prefix("mean_score:")
+        .map(str::trim)
+        .and_then(|value| value.parse::<f64>().ok())
+}
+
+#[cfg(test)]
 fn parse_mean_score(output: &str) -> Result<f64> {
     output
         .lines()
-        .find_map(|line| {
-            line.strip_prefix("mean_score:")
-                .map(str::trim)
-                .and_then(|value| value.parse::<f64>().ok())
-        })
+        .find_map(parse_mean_score_line)
         .ok_or_else(|| anyhow!("score_judge output missing parseable `mean_score:` line"))
+}
+
+fn parse_latest_mean_score(runtime_head: &RuntimeHead) -> Result<f64> {
+    runtime_head
+        .full_context
+        .iter()
+        .rev()
+        .filter(|message| {
+            message.role == RuntimeContextRole::Assistant
+                && message.context_layer == RuntimeContextLayer::ProcessStream
+        })
+        .find_map(|message| message.content.lines().rev().find_map(parse_mean_score_line))
+        .ok_or_else(|| anyhow!("score_judge history missing parseable `mean_score:` line"))
+}
+
+fn is_plan_monitor_trigger(trigger: &MonitorTriggerEntry) -> bool {
+    trigger
+        .metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .get("trigger_label")
+                .or_else(|| metadata.get("message_type"))
+        })
+        .and_then(Value::as_str)
+        .map(|value| value == "plan")
+        .unwrap_or(false)
+}
+
+fn plan_trigger_view(trigger: &MonitorTriggerEntry) -> Value {
+    json!({
+        "trigger_id": trigger.trigger_id,
+        "text": trigger.text,
+        "target_slot": trigger.target_slot,
+        "base_priority": trigger.base_priority,
+        "enabled": trigger.enabled,
+        "trigger_event": trigger.trigger_event.as_str(),
+    })
+}
+
+fn parse_loose_json_value(output: &str) -> Result<Value> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        bail!("output was empty");
+    }
+    if let Ok(parsed) = serde_json::from_str(trimmed) {
+        return Ok(parsed);
+    }
+
+    let lines = trimmed.lines().collect::<Vec<_>>();
+    if lines.len() >= 2
+        && lines
+            .first()
+            .map(|line| line.trim_start().starts_with("```"))
+            .unwrap_or(false)
+        && lines.last().map(|line| line.trim() == "```").unwrap_or(false)
+    {
+        let fenced_body = lines[1..lines.len() - 1].join("\n");
+        if let Ok(parsed) = serde_json::from_str(fenced_body.trim()) {
+            return Ok(parsed);
+        }
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start <= end {
+            if let Ok(parsed) = serde_json::from_str(&trimmed[start..=end]) {
+                return Ok(parsed);
+            }
+        }
+    }
+
+    Err(anyhow!("output did not contain parseable JSON"))
 }
 
 fn decide_prompt_adoption(prompt: &ProcessPromptRow, mean_score: f64) -> PromptAdoptionDecision {
@@ -986,6 +985,23 @@ fn decide_prompt_adoption(prompt: &ProcessPromptRow, mean_score: f64) -> PromptA
         Some(adopted) if mean_score > adopted => PromptAdoptionDecision::Promote,
         Some(_) => PromptAdoptionDecision::Rollback,
     }
+}
+
+fn parse_env_bool_flag(value: Option<String>) -> bool {
+    value
+        .as_deref()
+        .map(str::trim)
+        .map(|value| {
+            value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("yes")
+                || value.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+fn global_reprompt_includes_slot_for_mode(include_hidden: bool, slot_name: &str) -> bool {
+    include_hidden || !matches!(slot_name, HIDDEN_OPTIMIZER_SLOT_NAME | HIDDEN_SCORE_JUDGE_SLOT_NAME)
 }
 
 #[derive(Clone, Default)]
@@ -1048,12 +1064,6 @@ pub enum RuntimeSignalKind {
     ProviderCompleted,
     ForceBoundary,
     SendMessageCompleted,
-    // SendStarted,
-    // SendCompleted,
-    // ReceiveStarted,
-    // ReceiveCompleted,
-    // OutputCompleted,
-    // ForceInterrupted,
     FlushTick,
 }
 
@@ -1068,12 +1078,6 @@ impl RuntimeSignalKind {
             "provider_completed" => Some(Self::ProviderCompleted),
             "force_boundary" => Some(Self::ForceBoundary),
             "send_message_completed" => Some(Self::SendMessageCompleted),
-            // "send_started" => Some(Self::SendStarted),
-            // "send_completed" => Some(Self::SendCompleted),
-            // "receive_started" => Some(Self::ReceiveStarted),
-            // "receive_completed" => Some(Self::ReceiveCompleted),
-            // "output_completed" => Some(Self::OutputCompleted),
-            // "force_interrupted" => Some(Self::ForceInterrupted),
             "flush_tick" => Some(Self::FlushTick),
             _ => None,
         }
@@ -1089,12 +1093,6 @@ impl RuntimeSignalKind {
             Self::ProviderCompleted => "provider_completed",
             Self::ForceBoundary => "force_boundary",
             Self::SendMessageCompleted => "send_message_completed",
-            // Self::SendStarted => "send_started",
-            // Self::SendCompleted => "send_completed",
-            // Self::ReceiveStarted => "receive_started",
-            // Self::ReceiveCompleted => "receive_completed",
-            // Self::OutputCompleted => "output_completed",
-            // Self::ForceInterrupted => "force_interrupted",
             Self::FlushTick => "flush_tick",
         }
     }
@@ -1115,23 +1113,11 @@ pub struct RuntimeSignal {
     pub observed_at: DateTime<Utc>,
 }
 
-// #[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum BoundaryDecision {
     Continue,
     SealNow,
     Ignore,
-    // enum SequenceEngineAction {
-    //     SealCurrentSegment { process_id: Uuid },
-    //     OpenSegment { process_id: Uuid, segment_kind: String },
-    //     AppendToCurrent {
-    //         process_id: Uuid,
-    //         segment_kind: String,
-    //         content: String,
-    //         patch: Option<Value>,
-    //     },
-    //     ReleaseMailbox { process_id: Uuid },
-    //     MarkMailboxReleasePending { process_id: Uuid, cause: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1192,7 +1178,6 @@ struct SequenceRegistration {
     message_type: String,
     priority_mark: Option<String>,
     queue_target: Option<QueueSequenceTarget>,
-    guide: Option<String>,
 }
 
 struct SequenceRegistrationHandle {
@@ -1293,7 +1278,6 @@ impl MonitorEventSequenceEngine {
         }
     }
     async fn ingest(&self, signal: RuntimeSignal) -> BoundaryDecision {
-        // async fn ingest(&self, signal: RuntimeSignal) -> Vec<SequenceEngineAction> {
         let completed = {
             let mut inner = self.inner.lock().await;
             let mut completed = Vec::new();
@@ -1348,7 +1332,6 @@ impl MonitorEventSequenceEngine {
             self.finish_with_status(registration_id, "matched").await;
         }
         boundary_decision_from_signal(&signal)
-        // sequence_actions_from_signal(&signal)
     }
 
     async fn finish_with_status(&self, registration_id: Uuid, status: &str) {
@@ -1447,15 +1430,11 @@ impl MailboxBatch {
 #[derive(Debug, Clone)]
 struct ProcessMailbox {
     lanes: HashMap<(u8, DeliveryAction), VecDeque<MailboxBatch>>,
-    // pending_release_causes: Vec<String>,
 }
 
 impl ProcessMailbox {
     fn new() -> Self {
-        Self {
-            lanes: HashMap::new(),
-            // pending_release_causes: Vec::new(),
-        }
+        Self { lanes: HashMap::new() }
     }
 
     fn enqueue(&mut self, envelope: QueueEnvelope) -> QueueBatchInfo {
@@ -1495,22 +1474,6 @@ impl ProcessMailbox {
 
     fn is_empty(&self) -> bool {
         self.lanes.is_empty()
-        //     self.lanes.is_empty() && self.pending_release_causes.is_empty()
-        // }
-
-        // fn has_pending_release(&self) -> bool {
-        //     !self.pending_release_causes.is_empty()
-        // }
-
-        // fn mark_release_pending(&mut self, cause: impl Into<String>) {
-        //     let cause = cause.into();
-        //     if !cause.is_empty() && !self.pending_release_causes.iter().any(|item| item == &cause) {
-        //         self.pending_release_causes.push(cause);
-        //     }
-        // }
-
-        // fn clear_pending_release(&mut self) {
-        //     self.pending_release_causes.clear();
     }
 }
 
@@ -1610,22 +1573,6 @@ impl QueueDispatcher {
                     .entry(envelope.target_process_id)
                     .or_insert_with(ProcessMailbox::new);
                 mailbox.enqueue(envelope);
-                // let target_process_id = envelope.target_process_id;
-                // let should_try_release = {
-                //     let mut inner = self.mailboxes.inner.lock().await;
-                //     let mailbox = inner
-                //         .entry(target_process_id)
-                //         .or_insert_with(ProcessMailbox::new);
-                //     mailbox.enqueue(envelope);
-                //     mailbox.has_pending_release()
-                // };
-                // if should_try_release {
-                //     self.request_release_for_process(
-                //         target_process_id,
-                //         "pending_release_after_enqueue",
-                //     )
-                //     .await;
-                // }
             }
             DeliveryAction::PersistentAsyncClone | DeliveryAction::EphemeralAsyncClone => {
                 if let Err(error) = self.deliver_via_async_clone(envelope).await {
@@ -1736,7 +1683,6 @@ impl QueueDispatcher {
 
         if delivery_action == DeliveryAction::InterruptDeliver {
             let _ = self.force_boundary_for_process(&target).await;
-            // let _ = self.force_interrupt_for_process(&target).await;
         }
 
         let filtered = batch
@@ -2098,7 +2044,7 @@ impl QueueDispatcher {
                     .await?;
                 last_cloned_seq = segment.owner_seq;
             }
-            if let Some(open_live) = open_live_segment {
+            if let Some(open_live) = open_live_segment.as_ref() {
                 let mut cloned_open_live = OpenLiveSegment::new(
                     clone_process.id,
                     last_cloned_seq + 1,
@@ -2108,9 +2054,9 @@ impl QueueDispatcher {
                 );
                 cloned_open_live.apply_delta(
                     &open_live.content,
-                    Some(open_live.segment_kind),
-                    open_live.tokenizer,
-                    open_live.patch,
+                    Some(open_live.segment_kind.clone()),
+                    open_live.tokenizer.clone(),
+                    open_live.patch.clone(),
                 )?;
                 self.live_bus_registry.upsert(cloned_open_live).await;
             }
@@ -2124,9 +2070,12 @@ impl QueueDispatcher {
             self.runtime_head_registry
                 .upsert(ResidentPromptHeadState {
                     owner_id: clone_process.id,
-                    full_text: original_runtime_head.full_text.clone(),
-                    built_all_len: source_prompt_head.built_all_len,
-                    stream_started: source_prompt_head.stream_started,
+                    full_context: original_runtime_head.full_context.clone(),
+                    open_stream_index: if open_live_segment.is_some() {
+                        last_process_stream_index(&original_runtime_head.full_context)
+                    } else {
+                        None
+                    },
                     dirty: false,
                     last_bootstrap_segment_seq: source_prompt_head.last_bootstrap_segment_seq,
                 })
@@ -2516,7 +2465,6 @@ fn queue_batch_patch(
         .iter()
         .map(|envelope| envelope.source_kind.as_str().to_string())
         .collect::<Vec<_>>();
-    // Queue/runtime metadata stays on patch and does not become prompt text.
     let mut patch = json!({
         "queue_batch_id": info.batch_id.to_string(),
         "queue_envelope_ids": info.envelope_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
@@ -2802,7 +2750,6 @@ fn registration_outcome(registration: &SequenceRegistration, status: &str) -> Se
             "return_mode": registration.return_mode,
             "message_type": registration.message_type,
             "priority_mark": registration.priority_mark,
-            "guide": registration.guide,
         })),
     }
 }
@@ -2830,6 +2777,7 @@ pub struct RuntimeEngine {
     provider: Arc<dyn StreamingProvider>,
     provider_input_budget: usize,
     compaction_trigger_ratio: f32,
+    global_reprompt_include_hidden: bool,
     error_log_path: PathBuf,
 }
 
@@ -2897,12 +2845,14 @@ impl RuntimeEngine {
             provider,
             provider_input_budget: config.provider_input_budget,
             compaction_trigger_ratio: config.compaction_trigger_ratio,
+            global_reprompt_include_hidden: config.global_reprompt_include_hidden,
             error_log_path: config.error_log_path,
         };
 
         engine.start_control_worker(control_rx);
         queue_dispatcher.start(queue_rx);
         engine.start_persisted_flush_worker();
+        engine.start_score_judge_worker();
         engine.start_remote_task_executor(task_exec_rx);
         engine.start_hardware_executor(hardware_exec_rx);
         Ok(engine)
@@ -2956,6 +2906,21 @@ impl RuntimeEngine {
             loop {
                 ticker.tick().await;
                 let _ = runtime.flush_pending_persisted_segments().await;
+            }
+        });
+    }
+
+    fn start_score_judge_worker(&self) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_millis(SCORE_JUDGE_INTERVAL_MS));
+            loop {
+                ticker.tick().await;
+                if let Err(error) = runtime.run_periodic_score_judge_tick().await {
+                    runtime
+                        .log_raw_envelope("", &format!("periodic score_judge tick failed: {error}"))
+                        .await;
+                }
             }
         });
     }
@@ -3019,9 +2984,9 @@ impl RuntimeEngine {
             )
             .await?;
         self.dispatch_prepared_envelope(&target_binding, envelope.clone())?;
-        self.maybe_emit_optimizer_event(&sender_binding, &target_binding, &envelope)
-            .await?;
         self.handle_send_message_completed(&sender_binding, &envelope)
+            .await?;
+        self.maybe_emit_optimizer_event(&sender_binding, &target_binding, &envelope)
             .await?;
         Ok(envelope)
     }
@@ -3112,6 +3077,10 @@ impl RuntimeEngine {
             )
             .await?;
         }
+        self.queue_dispatcher
+            .release_for_process(envelope.target_process_id)
+            .await;
+        self.schedule_background_length_refresh(sender);
         Ok(())
     }
 
@@ -3518,6 +3487,10 @@ impl RuntimeEngine {
         )
     }
 
+    fn global_reprompt_includes_slot(&self, slot_name: &str) -> bool {
+        global_reprompt_includes_slot_for_mode(self.global_reprompt_include_hidden, slot_name)
+    }
+
     fn is_hidden_binding(binding: Option<&ProgramProcessBindingRow>) -> bool {
         binding
             .map(|value| Self::is_hidden_slot_name(&value.program_slot_name))
@@ -3545,24 +3518,6 @@ impl RuntimeEngine {
             program_slot_name: slot_name.to_string(),
         })
         .await
-    }
-
-    fn retarget_provider_stream_target(
-        &self,
-        host: &ProcessRuntimeBinding,
-        provider_stream_target: &ProviderStreamTarget,
-    ) -> ProviderStreamTarget {
-        ProviderStreamTarget {
-            live_owner: LiveOwnerRef::Process(host.process.id),
-            observed_process_id: host.process.id,
-            observed_slot: host
-                .binding
-                .as_ref()
-                .map(|binding| binding.program_slot_name.clone()),
-            executor_process_id: provider_stream_target
-                .executor_process_id
-                .map(|_| host.process.id),
-        }
     }
 
     async fn dispatch_system_message_direct(
@@ -3652,7 +3607,7 @@ impl RuntimeEngine {
         &self,
         hidden: &ProcessRuntimeBinding,
         tool_name: &str,
-        task: &str,
+        ephemeral_task: Option<ProviderMessage>,
     ) -> Result<String> {
         let runtime_head = resident_runtime_head(
             &self.db,
@@ -3680,8 +3635,7 @@ impl RuntimeEngine {
                 hidden,
                 &runtime_head,
                 &provider_stream_target,
-                None,
-                task,
+                ephemeral_task,
                 tool_run.tool_run_id,
             )
             .await
@@ -3697,6 +3651,48 @@ impl RuntimeEngine {
                 Err(error)
             }
         }
+    }
+
+    async fn run_periodic_score_judge_tick(&self) -> Result<()> {
+        let programs = self.db.list_programs().await?;
+        for program in programs {
+            if let Err(error) = self
+                .run_periodic_score_for_program(&program.program_run_id)
+                .await
+            {
+                self.log_raw_envelope(
+                    "",
+                    &format!(
+                        "periodic score_judge failed for program {}: {error}",
+                        program.program_run_id
+                    ),
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_periodic_score_for_program(&self, program_run_id: &str) -> Result<()> {
+        let score_judge = self
+            .resolve_hidden_process(program_run_id, HIDDEN_SCORE_JUDGE_SLOT_NAME)
+            .await?;
+        let optimizer = self
+            .resolve_hidden_process(program_run_id, HIDDEN_OPTIMIZER_SLOT_NAME)
+            .await?;
+
+        let score_text = self
+            .run_hidden_process_generation(
+                &score_judge,
+                HIDDEN_SCORE_JUDGE_TOOL_NAME,
+                Some(ProviderMessage::user(
+                    "Please score the current task's known message network from your runtime head. Output only two lines: `mean_score: <number>` and `note: <short text>`.",
+                )),
+            )
+            .await?;
+        self.dispatch_system_message_direct(&score_judge, &optimizer, "score_update", score_text)
+            .await?;
+        Ok(())
     }
 
     async fn maybe_emit_optimizer_event(
@@ -3749,32 +3745,48 @@ impl RuntimeEngine {
             .await?;
         self.send_process_prompt_snapshot(sender, &optimizer, sender)
             .await?;
+        let runtime = self.clone();
+        let sender = sender.clone();
+        let optimizer = optimizer.clone();
+        tokio::spawn(async move {
+            let hint = match runtime
+                .run_hidden_process_generation(&optimizer, HIDDEN_OPTIMIZER_TOOL_NAME, None)
+                .await
+            {
+                Ok(output) => output.trim().to_string(),
+                Err(error) => {
+                    runtime
+                        .log_raw_envelope(
+                            "",
+                            &format!(
+                                "async optimizer generation failed for process {}: {error}",
+                                optimizer.process.id
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+            };
 
-        let score_text = self
-            .run_hidden_process_generation(
-                &score_judge,
-                HIDDEN_SCORE_JUDGE_TOOL_NAME,
-                "Update the rolling coordination mean from the latest delivery event now visible in your runtime head. Output only two lines: `mean_score: <number>` and `note: <short text>`.",
-            )
-            .await?;
-        self.dispatch_system_message_direct(&score_judge, &optimizer, "score_update", score_text)
-            .await?;
+            if hint.is_empty() {
+                return;
+            }
 
-        let hint = self
-            .run_hidden_process_generation(
-                &optimizer,
-                HIDDEN_OPTIMIZER_TOOL_NAME,
-                &format!(
-                    "Write one short reminder sentence for process {} based on the latest delivery event, the latest score update, and the visible prompt snapshots in your runtime head. Output only the sentence.",
-                    sender.process.id
-                ),
-            )
-            .await?;
-        let hint = hint.trim().to_string();
-        if !hint.is_empty() {
-            self.dispatch_system_message_direct(&optimizer, sender, "optimizer_hint", hint)
-                .await?;
-        }
+            if let Err(error) = runtime
+                .dispatch_system_message_direct(&optimizer, &sender, "optimizer_hint", hint)
+                .await
+            {
+                runtime
+                    .log_raw_envelope(
+                        "",
+                        &format!(
+                            "async optimizer_hint dispatch failed for process {}: {error}",
+                            sender.process.id
+                        ),
+                    )
+                    .await;
+            }
+        });
         Ok(())
     }
 
@@ -3931,28 +3943,153 @@ impl RuntimeEngine {
         .await
     }
 
-    async fn maybe_run_global_reprompt(
-        &self,
-        host: &ProcessRuntimeBinding,
-        runtime_head: &RuntimeHead,
-        guide: Option<&str>,
-        task: &str,
-    ) -> Result<Option<ProcessRuntimeBinding>> {
+    fn schedule_background_length_refresh(&self, host: &ProcessRuntimeBinding) {
         let Some(binding) = host.binding.as_ref() else {
-            return Ok(None);
+            return;
         };
-        if Self::is_hidden_binding(host.binding.as_ref()) {
-            return Ok(None);
+
+        let runtime = self.clone();
+        let host = host.clone();
+        let program_run_id = binding.program_run_id.clone();
+        tokio::spawn(async move {
+            let context_length = match runtime.db.load_runtime_head(host.process.id).await {
+                Ok(runtime_head) => runtime_head.estimated_tokens,
+                Err(error) => {
+                    runtime
+                        .log_raw_envelope(
+                            "",
+                            &format!(
+                                "background length refresh failed to load runtime head for process {}: {error}",
+                                host.process.id
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            let refresh = match runtime
+                .db
+                .refresh_program_process_context_length(
+                    &program_run_id,
+                    host.process.id,
+                    context_length,
+                    runtime.global_reprompt_threshold(),
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    runtime
+                        .log_raw_envelope(
+                            "",
+                            &format!(
+                                "background length refresh failed for process {}: {error}",
+                                host.process.id
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            if !refresh.should_trigger_global_reprompt {
+                return;
+            }
+
+            let reprompt_host = match runtime
+                .resolve_global_reprompt_host(&program_run_id, &host)
+                .await
+            {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    let _ = runtime
+                        .db
+                        .set_program_global_phase(&program_run_id, "running")
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    let _ = runtime
+                        .db
+                        .set_program_global_phase(&program_run_id, "running")
+                        .await;
+                    runtime
+                        .log_raw_envelope(
+                            "",
+                            &format!(
+                                "background length refresh failed to resolve reprompt host for program {}: {error}",
+                                program_run_id
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+            };
+
+            let reprompt_result = runtime.run_global_reprompt(&reprompt_host).await;
+            let _ = runtime
+                .db
+                .set_program_global_phase(&program_run_id, "running")
+                .await;
+
+            if let Err(error) = reprompt_result {
+                runtime
+                    .log_raw_envelope(
+                        "",
+                        &format!(
+                            "background global reprompt failed for process {} after total persisted context_length {}: {error}",
+                            host.process.id,
+                            refresh.total_context_length
+                        ),
+                    )
+                    .await;
+            }
+        });
+    }
+
+    async fn resolve_global_reprompt_host(
+        &self,
+        program_run_id: &str,
+        host: &ProcessRuntimeBinding,
+    ) -> Result<Option<ProcessRuntimeBinding>> {
+        if !Self::is_hidden_binding(host.binding.as_ref()) {
+            return Ok(Some(host.clone()));
         }
 
-        let estimated_tokens =
-            approximate_token_count(&render_provider_user_prompt(guide, runtime_head, task))
-                as usize;
-        let threshold =
-            (self.provider_input_budget as f32 * self.compaction_trigger_ratio).ceil() as usize;
-        if estimated_tokens < threshold {
+        let bindings = self
+            .db
+            .list_process_instances_for_program_run(program_run_id)
+            .await?;
+        let Some(bound) = bindings
+            .into_iter()
+            .find(|bound| !Self::is_hidden_slot_name(&bound.binding.program_slot_name))
+        else {
             return Ok(None);
+        };
+
+        self.db
+            .get_process_runtime_binding(bound.process.id)
+            .await
+            .map(Some)
+    }
+
+    async fn run_global_reprompt(&self, host: &ProcessRuntimeBinding) -> Result<()> {
+        let Some(binding) = host.binding.as_ref() else {
+            return Ok(());
+        };
+        if Self::is_hidden_binding(host.binding.as_ref()) {
+            return Ok(());
         }
+
+        let program = self.db.get_program(&binding.program_run_id).await?;
+        let total_context_length = program
+            .plan_state_json
+            .process_context_lengths
+            .values()
+            .copied()
+            .sum::<usize>();
+        let threshold = self.global_reprompt_threshold();
 
         let active_prompts = self
             .db
@@ -3960,11 +4097,11 @@ impl RuntimeEngine {
             .await?
             .into_iter()
             .filter(|(prompt_binding, _)| {
-                !Self::is_hidden_slot_name(&prompt_binding.program_slot_name)
+                self.global_reprompt_includes_slot(&prompt_binding.program_slot_name)
             })
             .collect::<Vec<_>>();
         if active_prompts.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
 
         let score_judge = self
@@ -3973,21 +4110,14 @@ impl RuntimeEngine {
         let optimizer = self
             .resolve_hidden_process(&binding.program_run_id, HIDDEN_OPTIMIZER_SLOT_NAME)
             .await?;
-        let mean_score_text = self
-            .run_hidden_process_generation(
-                &score_judge,
-                HIDDEN_SCORE_JUDGE_TOOL_NAME,
-                "Report the current rolling coordination mean for this program from the runtime head you already have. Output only two lines: `mean_score: <number>` and `note: <short text>`.",
-            )
-            .await?;
-        let mean_score = parse_mean_score(&mean_score_text)?;
-        self.dispatch_system_message_direct(
-            &score_judge,
-            &optimizer,
-            "score_update",
-            mean_score_text,
+        let score_runtime_head = resident_runtime_head(
+            &self.db,
+            &self.live_bus_registry,
+            &self.runtime_head_registry,
+            score_judge.process.id,
         )
         .await?;
+        let mean_score = parse_latest_mean_score(&score_runtime_head)?;
 
         for (prompt_binding, prompt) in &active_prompts {
             let content = format!(
@@ -4010,13 +4140,12 @@ impl RuntimeEngine {
             &optimizer,
             "reprompt_request",
             format!(
-                "[reprompt_request]\nprogram_run_id: {}\ntrigger_process_id: {}\ntrigger_slot: {}\ninput_tokens: {}\nthreshold: {}\nmean_score: {}\n",
+                "[reprompt_request]\nprogram_run_id: {}\ntrigger_process_id: {}\ntrigger_slot: {}\ntotal_context_length: {}\nthreshold: {}\nmean_score: {}\n",
                 binding.program_run_id,
                 host.process.id,
                 binding.program_slot_name,
-                estimated_tokens,
-                threshold
-                ,
+                total_context_length,
+                threshold,
                 mean_score
             ),
         )
@@ -4026,7 +4155,9 @@ impl RuntimeEngine {
             .run_hidden_process_generation(
                 &optimizer,
                 HIDDEN_REPROMPT_TOOL_NAME,
-                "Rewrite the current process prompts for this program. Output only blocks in this exact format: `@@process <process_id>` on its own line, then the full prompt text, then `@@end` on its own line. Do not output anything else.",
+                Some(ProviderMessage::user(
+                    "Rewrite the current process prompts for this program. Output only blocks in this exact format: `@@process <process_id>` on its own line, then the full prompt text, then `@@end` on its own line. Do not output anything else.",
+                )),
             )
             .await?;
         let reprompt_blocks = parse_reprompt_blocks(&output)?;
@@ -4042,14 +4173,13 @@ impl RuntimeEngine {
             bail!("reprompt output contained duplicate process ids");
         }
 
-        let mut current_host = None;
         for (process_binding, current_prompt) in active_prompts {
             let process_id = process_binding.process_id;
             let prompt_text = reprompt_map
                 .get(&process_id)
                 .ok_or_else(|| anyhow!("reprompt output missing active process {}", process_id))?;
             let process = self.db.get_process_instance(process_id).await?;
-            let rotated = match decide_prompt_adoption(&current_prompt, mean_score) {
+            let _rotated = match decide_prompt_adoption(&current_prompt, mean_score) {
                 PromptAdoptionDecision::Promote => {
                     self.promote_process_for_reprompt(
                         &process_binding,
@@ -4069,11 +4199,8 @@ impl RuntimeEngine {
                     .await?
                 }
             };
-            if process_id == host.process.id {
-                current_host = Some(rotated);
-            }
         }
-        Ok(current_host)
+        Ok(())
     }
 
     async fn prepare_message_envelope(
@@ -4177,8 +4304,8 @@ impl RuntimeEngine {
         base_priority: u8,
         requested_delivery_action: DeliveryAction,
         content: Option<&str>,
-        task_sequence: &[TaskStep],
-        hardware_sequence: &[HardwareStep],
+        _task_sequence: &[TaskStep],
+        _hardware_sequence: &[HardwareStep],
     ) -> Result<(u8, DeliveryAction, Option<String>)> {
         if self.is_direct_downstream(sender, target).await? {
             return Ok((base_priority, requested_delivery_action, None));
@@ -4191,8 +4318,6 @@ impl RuntimeEngine {
             base_priority,
             requested_delivery_action,
             content,
-            task_sequence,
-            hardware_sequence,
         )
         .await
     }
@@ -4237,58 +4362,30 @@ impl RuntimeEngine {
         base_priority: u8,
         requested_delivery_action: DeliveryAction,
         content: Option<&str>,
-        task_sequence: &[TaskStep],
-        hardware_sequence: &[HardwareStep],
     ) -> Result<(u8, DeliveryAction, Option<String>)> {
-        let sender_head = resident_runtime_head(
-            &self.db,
-            &self.live_bus_registry,
-            &self.runtime_head_registry,
-            sender.process.id,
-        )
-        .await
-        .map(|head| head.full_text)
-        .unwrap_or_default();
-        let task_summary = if task_sequence.is_empty() {
-            String::new()
-        } else {
-            task_sequence_summary(task_sequence)
-        };
-        let hardware_summary = if hardware_sequence.is_empty() {
-            String::new()
-        } else {
-            hardware_sequence_summary(hardware_sequence)
-        };
-        let relation_summary = json!({
-            "sender_process_id": sender.process.id.to_string(),
-            "sender_slot": sender.binding.as_ref().map(|binding| binding.program_slot_name.clone()),
-            "target_process_id": target.process.id.to_string(),
-            "target_slot": target.binding.as_ref().map(|binding| binding.program_slot_name.clone()),
-            "same_program": sender.binding.as_ref().zip(target.binding.as_ref()).map(|(left, right)| left.program_run_id == right.program_run_id).unwrap_or(false),
-        });
-        let messages = vec![
-            ProviderMessage::system(
-                "You are a delivery judge. Return JSON only with keys `final_priority`, `final_delivery_action`, and optional `bounce_hint`.",
-            ),
-            ProviderMessage::system(
-                "Allowed actions: interrupt_deliver, persistent_async_clone, segment_boundary_deliver, ephemeral_async_clone, bounce_with_hint, ignore, blacklist_sender.",
-            ),
-            ProviderMessage::user(format!(
-                "[relation]\n{}\n\n[sender_runtime_head]\n{}\n\n[message]\nmessage_kind: {}\nbase_priority: {}\nrequested_delivery_action: {}\ncontent: {}\ntask_sequence:\n{}\n\nhardware_sequence:\n{}",
-                serde_json::to_string_pretty(&relation_summary).unwrap_or_else(|_| "{}".to_string()),
-                sender_head,
-                message_kind.as_str(),
-                base_priority,
-                requested_delivery_action.as_str(),
-                content.unwrap_or(""),
-                task_summary,
-                hardware_summary,
-            )),
-        ];
+        let sender_slot = sender
+            .binding
+            .as_ref()
+            .map(|binding| binding.program_slot_name.as_str())
+            .unwrap_or(sender.process.external_slot_name.as_str());
+        let target_slot = target
+            .binding
+            .as_ref()
+            .map(|binding| binding.program_slot_name.as_str())
+            .unwrap_or(target.process.external_slot_name.as_str());
+        let messages = vec![ProviderMessage::user(format!(
+            "Return JSON only with keys `final_priority`, `final_delivery_action`, and optional `bounce_hint`.\nAllowed actions: interrupt_deliver, persistent_async_clone, segment_boundary_deliver, ephemeral_async_clone, bounce_with_hint, ignore, blacklist_sender.\nsender_slot: {}\ntarget_slot: {}\nmessage_kind: {}\nbase_priority: {}\nrequested_delivery_action: {}\ncontent: {}",
+            sender_slot,
+            target_slot,
+            message_kind.as_str(),
+            base_priority,
+            requested_delivery_action.as_str(),
+            content.unwrap_or(""),
+        ))];
         let (chunk_tx, _chunk_rx) = mpsc::unbounded_channel();
         let output = self.provider.stream_text(messages, chunk_tx).await?;
-        let parsed: Value =
-            serde_json::from_str(&output).context("delivery judge must return valid JSON")?;
+        let parsed =
+            parse_loose_json_value(&output).context("delivery judge must return valid JSON")?;
         let final_priority = parsed
             .get("final_priority")
             .and_then(Value::as_u64)
@@ -4786,12 +4883,6 @@ impl RuntimeEngine {
         if !is_builtin_tool && !is_external_tool {
             bail!("unsupported tool_name {}", tool_name);
         }
-        if is_builtin_tool
-            && tool_requires_guide(tool_name, tool_args)
-            && extract_tool_guide(tool_args).is_none()
-        {
-            bail!("{tool_name} requires `输入子进程用途引导` or `guide`");
-        }
 
         match tool_name {
             TOOL_CREATE_PROGRAM => self.tool_create_program(host, tool_run_id, tool_args).await,
@@ -4830,26 +4921,9 @@ impl RuntimeEngine {
                 self.tool_inspect_process_table(host, tool_run_id, tool_args)
                     .await
             }
-            TOOL_MAKE_PLAN => {
-                self.tool_make_plan(
-                    host,
-                    runtime_head,
-                    provider_stream_target,
-                    tool_run_id,
-                    tool_args,
-                )
-                .await
-            }
-            TOOL_REPAIR_PLAN => {
-                self.tool_repair_plan(
-                    host,
-                    runtime_head,
-                    provider_stream_target,
-                    tool_run_id,
-                    tool_args,
-                )
-                .await
-            }
+            TOOL_VIEW_PLAN => self.tool_view_plan(host, tool_run_id, tool_args).await,
+            TOOL_ADD_PLAN => self.tool_add_plan(host, tool_run_id, tool_args).await,
+            TOOL_DEL_PLAN => self.tool_del_plan(host, tool_run_id, tool_args).await,
             TOOL_APPEND_OUTPUT_REF => {
                 self.tool_append_output_ref(host, tool_run_id, tool_args)
                     .await
@@ -5153,16 +5227,13 @@ impl RuntimeEngine {
         tool_run_id: Uuid,
         tool_args: &Value,
     ) -> Result<(String, Option<Value>, Option<SegmentRow>)> {
-        let guide = extract_tool_guide(tool_args);
-        let task = optional_string(tool_args, "task").unwrap_or_else(|| "branch task".to_string());
+        let _task = optional_string(tool_args, "task").unwrap_or_else(|| "branch task".to_string());
         let generated = self
             .generate_text_with_provider(
                 TOOL_SPAWN_BRANCH_PROCESS,
                 host,
                 runtime_head,
                 provider_stream_target,
-                guide.as_deref(),
-                &task,
                 tool_run_id,
             )
             .await?;
@@ -5318,7 +5389,6 @@ impl RuntimeEngine {
                 .unwrap_or_else(|| "monitor_event_sequence".to_string()),
             priority_mark: optional_string(tool_args, "priority_mark"),
             queue_target,
-            guide: extract_tool_guide(tool_args),
         };
 
         let outcome_rx = self.sequence_engine.register(registration.clone()).await;
@@ -5493,125 +5563,162 @@ impl RuntimeEngine {
         Ok((serde_json::to_string(&value)?, None, None))
     }
 
-    async fn tool_make_plan(
+    async fn tool_view_plan(
         &self,
         host: &ProcessRuntimeBinding,
-        runtime_head: &RuntimeHead,
-        provider_stream_target: &ProviderStreamTarget,
-        tool_run_id: Uuid,
+        _tool_run_id: Uuid,
         tool_args: &Value,
     ) -> Result<(String, Option<Value>, Option<SegmentRow>)> {
-        if host.binding.is_none() {
-            bail!("make_plan requires host process bound to a program slot");
-        }
-        let guide = extract_tool_guide(tool_args);
-        let objective = optional_string(tool_args, "objective")
-            .unwrap_or_else(|| "Propose the next slot-local plan step.".to_string());
-        let generated = self
-            .generate_text_with_provider(
-                TOOL_MAKE_PLAN,
-                host,
-                runtime_head,
-                provider_stream_target,
-                guide.as_deref(),
-                &objective,
-                tool_run_id,
-            )
-            .await?;
-        let binding =
-            generated.host.binding.as_ref().ok_or_else(|| {
-                anyhow!("make_plan requires host process bound to a program slot")
-            })?;
-        let output = generated.output.clone();
-
-        let mut program = self.db.get_program(&binding.program_run_id).await?;
+        let binding = host
+            .binding
+            .as_ref()
+            .ok_or_else(|| anyhow!("view_plan requires host process bound to a program slot"))?;
         let slot_name = optional_string(tool_args, "program_slot_name")
             .unwrap_or_else(|| binding.program_slot_name.clone());
-        let inherited_prefix_suffix_definite_id = program
-            .plan_state_json
-            .slots
-            .get(&binding.program_slot_name)
-            .and_then(|slot| slot.prefix_suffix_definite_id)
-            .or(Some(host.process.prefix_suffix_definite_id));
+        let program = self.db.get_program(&binding.program_run_id).await?;
         let slot_state = program
             .plan_state_json
             .slots
-            .entry(slot_name.clone())
-            .or_insert_with(|| {
-                default_program_slot_state(
-                    &slot_name,
-                    inherited_prefix_suffix_definite_id,
-                    (slot_name != binding.program_slot_name)
-                        .then(|| binding.program_slot_name.clone()),
-                    slot_name.clone(),
-                    slot_name.clone(),
-                    Vec::new(),
-                )
+            .get(&slot_name)
+            .ok_or_else(|| anyhow!("program slot {} not found in {}", slot_name, binding.program_run_id))?;
+        let entries = slot_state
+            .monitor_triggers
+            .iter()
+            .filter(|trigger| is_plan_monitor_trigger(trigger))
+            .map(plan_trigger_view)
+            .collect::<Vec<_>>();
+        Ok((
+            serde_json::to_string(&json!({
+                "program_run_id": binding.program_run_id,
+                "program_slot_name": slot_name,
+                "plan_version": program.plan_state_json.plan_version,
+                "entries": entries,
+            }))?,
+            None,
+            None,
+        ))
+    }
+
+    async fn tool_add_plan(
+        &self,
+        host: &ProcessRuntimeBinding,
+        tool_run_id: Uuid,
+        tool_args: &Value,
+    ) -> Result<(String, Option<Value>, Option<SegmentRow>)> {
+        let binding = host
+            .binding
+            .as_ref()
+            .ok_or_else(|| anyhow!("add_plan requires host process bound to a program slot"))?;
+        let slot_name = optional_string(tool_args, "program_slot_name")
+            .unwrap_or_else(|| binding.program_slot_name.clone());
+        let target_slot =
+            optional_string(tool_args, "target_slot").unwrap_or_else(|| slot_name.clone());
+        let entries = required_string_array(tool_args, "entries")?;
+        let base_priority = optional_u8(tool_args, "base_priority").unwrap_or(4);
+        if !(1..=8).contains(&base_priority) {
+            bail!("base_priority must be between 1 and 8");
+        }
+
+        let mut program = self.db.get_program(&binding.program_run_id).await?;
+        if !program.plan_state_json.slots.contains_key(&slot_name) {
+            bail!("program slot {} not found in {}", slot_name, binding.program_run_id);
+        }
+        if !program.plan_state_json.slots.contains_key(&target_slot) {
+            bail!(
+                "target_slot {} not found in {}",
+                target_slot,
+                binding.program_run_id
+            );
+        }
+        let slot_state = program
+            .plan_state_json
+            .slots
+            .get_mut(&slot_name)
+            .expect("slot existence checked above");
+        for entry in entries {
+            let text = entry.trim();
+            if text.is_empty() {
+                bail!("entries must not contain empty text");
+            }
+            slot_state.monitor_triggers.push(MonitorTriggerEntry {
+                trigger_id: format!("{slot_name}.plan.{}", Uuid::new_v4()),
+                trigger_event: MonitorTriggerEvent::SendMessageCompleted,
+                emitted_message_kind: MessageKind::NormalMessage,
+                text: text.to_string(),
+                target_slot: target_slot.clone(),
+                base_priority,
+                requested_delivery_action: DeliveryAction::SegmentBoundaryDeliver,
+                delay_ms: None,
+                result_target: ResultTarget::Sender,
+                content_template: Some(text.to_string()),
+                task_sequence: Vec::new(),
+                hardware_sequence: Vec::new(),
+                metadata: Some(json!({
+                    "message_type": "plan",
+                    "trigger_label": "plan",
+                    "tool_name": TOOL_ADD_PLAN,
+                    "tool_run_id": tool_run_id,
+                })),
+                enabled: true,
             });
-        slot_state.monitor_triggers = vec![MonitorTriggerEntry {
-            trigger_id: format!("{slot_name}.trigger.{}", Uuid::new_v4()),
-            trigger_event: MonitorTriggerEvent::SendMessageCompleted,
-            emitted_message_kind: MessageKind::NormalMessage,
-            text: output.clone(),
-            target_slot: slot_name.clone(),
-            base_priority: 4,
-            requested_delivery_action: DeliveryAction::SegmentBoundaryDeliver,
-            delay_ms: None,
-            result_target: ResultTarget::Sender,
-            content_template: Some(output.clone()),
-            task_sequence: Vec::new(),
-            hardware_sequence: Vec::new(),
-            metadata: Some(json!({
-                "message_type": "plan",
-                "trigger_label": "plan",
-            })),
-            enabled: true,
-        }];
+        }
         slot_state.updated_at = Utc::now();
+        program.plan_state_json.plan_version += 1;
         self.db
             .update_program_plan_state(&binding.program_run_id, &program.plan_state_json)
             .await?;
 
-        Ok((output, None, None))
+        self.tool_view_plan(host, tool_run_id, &json!({ "program_slot_name": slot_name }))
+            .await
     }
 
-    async fn tool_repair_plan(
+    async fn tool_del_plan(
         &self,
         host: &ProcessRuntimeBinding,
-        runtime_head: &RuntimeHead,
-        provider_stream_target: &ProviderStreamTarget,
         tool_run_id: Uuid,
         tool_args: &Value,
     ) -> Result<(String, Option<Value>, Option<SegmentRow>)> {
-        let guide = extract_tool_guide(tool_args);
-        let issue = optional_string(tool_args, "issue")
-            .unwrap_or_else(|| "Repair the current slot-local plan.".to_string());
-        let generated = self
-            .generate_text_with_provider(
-                TOOL_REPAIR_PLAN,
-                host,
-                runtime_head,
-                provider_stream_target,
-                guide.as_deref(),
-                &issue,
-                tool_run_id,
-            )
+        let binding = host
+            .binding
+            .as_ref()
+            .ok_or_else(|| anyhow!("del_plan requires host process bound to a program slot"))?;
+        let slot_name = optional_string(tool_args, "program_slot_name")
+            .unwrap_or_else(|| binding.program_slot_name.clone());
+        let trigger_ids = required_string_array(tool_args, "trigger_ids")?;
+
+        let mut program = self.db.get_program(&binding.program_run_id).await?;
+        let slot_state = program
+            .plan_state_json
+            .slots
+            .get_mut(&slot_name)
+            .ok_or_else(|| anyhow!("program slot {} not found in {}", slot_name, binding.program_run_id))?;
+
+        let existing_ids = slot_state
+            .monitor_triggers
+            .iter()
+            .filter(|trigger| is_plan_monitor_trigger(trigger))
+            .map(|trigger| trigger.trigger_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let missing = trigger_ids
+            .iter()
+            .filter(|trigger_id| !existing_ids.contains(trigger_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!("trigger_ids not found in plan set: {}", missing.join(", "));
+        }
+
+        slot_state.monitor_triggers.retain(|trigger| {
+            !(is_plan_monitor_trigger(trigger) && trigger_ids.iter().any(|id| id == &trigger.trigger_id))
+        });
+        slot_state.updated_at = Utc::now();
+        program.plan_state_json.plan_version += 1;
+        self.db
+            .update_program_plan_state(&binding.program_run_id, &program.plan_state_json)
             .await?;
-        let output = generated.output.clone();
 
-        self.tool_make_plan(
-            &generated.host,
-            &generated.runtime_head,
-            &generated.provider_stream_target,
-            tool_run_id,
-            &json!({
-                "objective": output.clone(),
-                "program_slot_name": optional_string(tool_args, "program_slot_name"),
-            }),
-        )
-        .await?;
-
-        Ok((output, None, None))
+        self.tool_view_plan(host, tool_run_id, &json!({ "program_slot_name": slot_name }))
+            .await
     }
 
     async fn tool_append_output_ref(
@@ -5680,52 +5787,26 @@ impl RuntimeEngine {
         host: &ProcessRuntimeBinding,
         runtime_head: &RuntimeHead,
         provider_stream_target: &ProviderStreamTarget,
-        guide: Option<&str>,
-        task: &str,
         tool_run_id: Uuid,
     ) -> Result<ProviderGeneration> {
-        let mut effective_host = host.clone();
-        let mut effective_runtime_head = runtime_head.clone();
-        let mut effective_provider_stream_target = provider_stream_target.clone();
-
-        if matches!(
-            provider_stream_target.live_owner,
-            LiveOwnerRef::Process(process_id) if process_id == host.process.id
-        ) {
-            if let Some(rotated_host) = self
-                .maybe_run_global_reprompt(host, runtime_head, guide, task)
-                .await?
-            {
-                effective_runtime_head = resident_runtime_head(
-                    &self.db,
-                    &self.live_bus_registry,
-                    &self.runtime_head_registry,
-                    rotated_host.process.id,
-                )
-                .await?;
-                effective_provider_stream_target =
-                    self.retarget_provider_stream_target(&rotated_host, provider_stream_target);
-                effective_host = rotated_host;
-            }
-        }
-
         let output = self
             .generate_text_with_provider_core(
                 tool_name,
-                &effective_host,
-                &effective_runtime_head,
-                &effective_provider_stream_target,
-                guide,
-                task,
+                host,
+                runtime_head,
+                provider_stream_target,
+                None,
                 tool_run_id,
             )
             .await?;
         Ok(ProviderGeneration {
-            host: effective_host,
-            runtime_head: effective_runtime_head,
-            provider_stream_target: effective_provider_stream_target,
+            host: host.clone(),
             output,
         })
+    }
+
+    fn global_reprompt_threshold(&self) -> usize {
+        (self.provider_input_budget as f32 * self.compaction_trigger_ratio).ceil() as usize
     }
 
     async fn generate_text_with_provider_core(
@@ -5734,17 +5815,10 @@ impl RuntimeEngine {
         host: &ProcessRuntimeBinding,
         runtime_head: &RuntimeHead,
         provider_stream_target: &ProviderStreamTarget,
-        guide: Option<&str>,
-        task: &str,
+        ephemeral_task: Option<ProviderMessage>,
         tool_run_id: Uuid,
     ) -> Result<String> {
-        let messages = vec![
-            ProviderMessage::system("You are a virtual sub-process attached to a host process."),
-            ProviderMessage::system(
-                "Use the host runtime head as factual context. Be concise and task-complete.",
-            ),
-            ProviderMessage::user(render_provider_user_prompt(guide, runtime_head, task)),
-        ];
+        let messages = render_provider_messages(runtime_head, ephemeral_task);
 
         let _process_stream_permit = match provider_stream_target.live_owner {
             LiveOwnerRef::Process(process_id) => {
@@ -5905,6 +5979,29 @@ fn optional_string(value: &Value, key: &str) -> Option<String> {
         .get(key)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn required_string_array(value: &Value, key: &str) -> Result<Vec<String>> {
+    let items = value
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("{key} must be an array of strings"))?;
+    let parsed = items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| anyhow!("{key} must contain only strings"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        bail!("{key} must not be empty");
+    }
+    Ok(parsed)
+}
+
+fn optional_u8(value: &Value, key: &str) -> Option<u8> {
+    value.get(key).and_then(Value::as_u64).and_then(|raw| u8::try_from(raw).ok())
 }
 
 fn required_uuid(value: &Value, key: &str) -> Result<Uuid> {
@@ -6133,9 +6230,15 @@ mod tests {
         registry
             .upsert(ResidentPromptHeadState {
                 owner_id: stream_id,
-                full_text: "existing".to_string(),
-                built_all_len: "existing".len(),
-                stream_started: false,
+                full_context: vec![RuntimeContextMessage {
+                    role: RuntimeContextRole::System,
+                    content: "existing".to_string(),
+                    context_layer: RuntimeContextLayer::Prefix,
+                    process_id: None,
+                    slot_name: None,
+                    io_kind: None,
+                }],
+                open_stream_index: None,
                 dirty: false,
                 last_bootstrap_segment_seq: 3,
             })
@@ -6146,13 +6249,22 @@ mod tests {
             stream_id,
             &RuntimeHead {
                 process_id: Uuid::new_v4(),
-                full_text: "snapshot".to_string(),
+                full_context: vec![RuntimeContextMessage {
+                    role: RuntimeContextRole::Assistant,
+                    content: "snapshot".to_string(),
+                    context_layer: RuntimeContextLayer::Suffix,
+                    process_id: None,
+                    slot_name: None,
+                    io_kind: None,
+                }],
+                estimated_tokens: 5,
             },
         )
         .await;
 
         let state = registry.get(stream_id).await.expect("state should exist");
-        assert_eq!(state.full_text, "existing");
+        assert_eq!(state.full_context.len(), 1);
+        assert_eq!(state.full_context[0].content, "existing");
         assert_eq!(state.last_bootstrap_segment_seq, 3);
     }
 
@@ -6166,7 +6278,15 @@ mod tests {
                 stream_id,
                 &RuntimeHead {
                     process_id: Uuid::new_v4(),
-                    full_text: "[seed]".to_string(),
+                    full_context: vec![RuntimeContextMessage {
+                        role: RuntimeContextRole::System,
+                        content: "[seed]".to_string(),
+                        context_layer: RuntimeContextLayer::Prefix,
+                        process_id: None,
+                        slot_name: None,
+                        io_kind: None,
+                    }],
+                    estimated_tokens: 5,
                 },
                 0,
             ))
@@ -6189,7 +6309,12 @@ mod tests {
             .get(stream_id)
             .await
             .expect("runtime head should exist");
-        assert!(state.full_text.contains("[mailbox]\nhello"));
+        assert!(
+            state
+                .full_context
+                .iter()
+                .any(|message| message.content.contains("[mailbox]\nhello"))
+        );
 
         let live_segment = live_bus_registry
             .get(stream_id)
@@ -6222,24 +6347,133 @@ mod tests {
     }
 
     #[test]
-    fn provider_prompt_uses_runtime_head_without_duplicate_process_prompt_section() {
-        let rendered = render_provider_user_prompt(
-            Some("guide"),
+    fn provider_messages_preserve_role_order_and_append_ephemeral_user_task() {
+        let rendered = render_provider_messages(
             &RuntimeHead {
                 process_id: Uuid::new_v4(),
-                full_text: "PREFIX\n\n[process_prompt]\nREMINDER\n\n[process_stream]\nhello"
-                    .to_string(),
+                full_context: vec![
+                    RuntimeContextMessage {
+                        role: RuntimeContextRole::System,
+                        content: "PREFIX".to_string(),
+                        context_layer: RuntimeContextLayer::Prefix,
+                        process_id: None,
+                        slot_name: None,
+                        io_kind: None,
+                    },
+                    RuntimeContextMessage {
+                        role: RuntimeContextRole::User,
+                        content: "REMINDER".to_string(),
+                        context_layer: RuntimeContextLayer::ProcessPrompt,
+                        process_id: None,
+                        slot_name: None,
+                        io_kind: None,
+                    },
+                    RuntimeContextMessage {
+                        role: RuntimeContextRole::Assistant,
+                        content: "hello".to_string(),
+                        context_layer: RuntimeContextLayer::ProcessStream,
+                        process_id: None,
+                        slot_name: None,
+                        io_kind: None,
+                    },
+                ],
+                estimated_tokens: 12,
             },
-            "task",
+            Some(ProviderMessage::user("task")),
         );
 
-        assert_eq!(rendered.matches("[process_prompt]").count(), 1);
+        assert_eq!(rendered.len(), 4);
+        assert_eq!(rendered[0].role, "system");
+        assert_eq!(rendered[1].role, "user");
+        assert_eq!(rendered[2].role, "assistant");
+        assert_eq!(rendered[3].role, "user");
+        assert_eq!(rendered[3].content, "task");
     }
 
     #[test]
     fn parse_mean_score_reads_numeric_line() {
         let parsed = parse_mean_score("mean_score: 8.5\nnote: stable").expect("score should parse");
         assert_eq!(parsed, 8.5);
+    }
+
+    #[test]
+    fn parse_latest_mean_score_reads_last_numeric_line() {
+        let parsed = parse_latest_mean_score(&RuntimeHead {
+            process_id: Uuid::new_v4(),
+            full_context: vec![
+                RuntimeContextMessage {
+                    role: RuntimeContextRole::Assistant,
+                    content: "mean_score: 7.0\nnote: earlier".to_string(),
+                    context_layer: RuntimeContextLayer::ProcessStream,
+                    process_id: None,
+                    slot_name: None,
+                    io_kind: None,
+                },
+                RuntimeContextMessage {
+                    role: RuntimeContextRole::Assistant,
+                    content: "mean_score: 8.5\nnote: latest".to_string(),
+                    context_layer: RuntimeContextLayer::ProcessStream,
+                    process_id: None,
+                    slot_name: None,
+                    io_kind: None,
+                },
+            ],
+            estimated_tokens: 12,
+        })
+        .expect("latest score should parse");
+        assert_eq!(parsed, 8.5);
+    }
+
+    #[test]
+    fn parse_env_bool_flag_defaults_false_and_accepts_true_values() {
+        assert!(!parse_env_bool_flag(None));
+        assert!(!parse_env_bool_flag(Some("false".to_string())));
+        assert!(parse_env_bool_flag(Some("true".to_string())));
+        assert!(parse_env_bool_flag(Some("1".to_string())));
+        assert!(parse_env_bool_flag(Some(" yes ".to_string())));
+    }
+
+    #[test]
+    fn global_reprompt_include_hidden_flag_controls_hidden_targets() {
+        assert!(global_reprompt_includes_slot_for_mode(false, "planner"));
+        assert!(!global_reprompt_includes_slot_for_mode(
+            false,
+            HIDDEN_OPTIMIZER_SLOT_NAME
+        ));
+        assert!(!global_reprompt_includes_slot_for_mode(
+            false,
+            HIDDEN_SCORE_JUDGE_SLOT_NAME
+        ));
+        assert!(global_reprompt_includes_slot_for_mode(
+            true,
+            HIDDEN_OPTIMIZER_SLOT_NAME
+        ));
+        assert!(global_reprompt_includes_slot_for_mode(
+            true,
+            HIDDEN_SCORE_JUDGE_SLOT_NAME
+        ));
+    }
+
+    #[test]
+    fn parse_loose_json_value_accepts_fenced_json() {
+        let parsed = parse_loose_json_value(
+            "```json\n{\"final_priority\":4,\"final_delivery_action\":\"ignore\"}\n```",
+        )
+        .expect("fenced JSON should parse");
+
+        assert_eq!(parsed["final_priority"], 4);
+        assert_eq!(parsed["final_delivery_action"], "ignore");
+    }
+
+    #[test]
+    fn parse_loose_json_value_extracts_json_from_wrapped_text() {
+        let parsed = parse_loose_json_value(
+            "I considered the routing.\n```json\n{\"final_priority\":5,\"final_delivery_action\":\"bounce_with_hint\"}\n```\nUse this result.",
+        )
+        .expect("wrapped JSON should parse");
+
+        assert_eq!(parsed["final_priority"], 5);
+        assert_eq!(parsed["final_delivery_action"], "bounce_with_hint");
     }
 
     #[test]

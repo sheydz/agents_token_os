@@ -20,8 +20,9 @@ pub const TOOL_MONITOR_EVENT_SEQUENCE: &str = "monitor_event_sequence";
 pub const TOOL_HISTORY_QUERY: &str = "history_query";
 pub const TOOL_HISTORY_ANNOTATE: &str = "history_annotate";
 pub const TOOL_INSPECT_PROCESS_TABLE: &str = "inspect_process_table";
-pub const TOOL_MAKE_PLAN: &str = "make_plan";
-pub const TOOL_REPAIR_PLAN: &str = "repair_plan";
+pub const TOOL_VIEW_PLAN: &str = "view_plan";
+pub const TOOL_ADD_PLAN: &str = "add_plan";
+pub const TOOL_DEL_PLAN: &str = "del_plan";
 pub const TOOL_APPEND_OUTPUT_REF: &str = "append_output_ref";
 pub const TOOL_DELETE_RESULT_ARTIFACT: &str = "delete_result_artifact";
 
@@ -170,8 +171,9 @@ impl Default for ToolRegistry {
             TOOL_HISTORY_QUERY,
             TOOL_HISTORY_ANNOTATE,
             TOOL_INSPECT_PROCESS_TABLE,
-            TOOL_MAKE_PLAN,
-            TOOL_REPAIR_PLAN,
+            TOOL_VIEW_PLAN,
+            TOOL_ADD_PLAN,
+            TOOL_DEL_PLAN,
             TOOL_APPEND_OUTPUT_REF,
             TOOL_DELETE_RESULT_ARTIFACT,
         ]
@@ -283,34 +285,9 @@ pub fn blacklist_blocks_message(
 
 pub fn tool_requires_provider(tool_name: &str, _tool_args: &Value) -> bool {
     match tool_name {
-        TOOL_SPAWN_BRANCH_PROCESS | TOOL_MAKE_PLAN | TOOL_REPAIR_PLAN => true,
-        _ => false,
-    }
-}
-
-pub fn tool_requires_guide(tool_name: &str, tool_args: &Value) -> bool {
-    match tool_name {
         TOOL_SPAWN_BRANCH_PROCESS => true,
-        TOOL_MONITOR_EVENT_SEQUENCE => tool_args
-            .get("mode")
-            .and_then(Value::as_str)
-            .map(|mode| matches!(mode, "watch" | "background_monitor"))
-            .unwrap_or(false),
         _ => false,
     }
-}
-
-pub fn extract_tool_guide(tool_args: &Value) -> Option<String> {
-    tool_args
-        .get("输入子进程用途引导")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            tool_args
-                .get("guide")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
 }
 
 pub fn target_selector_from_value(value: &Value) -> Option<TargetSelector> {
@@ -371,7 +348,7 @@ pub fn tool_result_patch(
 pub fn default_deadline_ms(tool_name: &str) -> Option<u64> {
     match tool_name {
         TOOL_MONITOR_EVENT_SEQUENCE => Some(30_000),
-        TOOL_SPAWN_BRANCH_PROCESS | TOOL_MAKE_PLAN | TOOL_REPAIR_PLAN => Some(60_000),
+        TOOL_SPAWN_BRANCH_PROCESS => Some(60_000),
         _ => Some(15_000),
     }
 }
@@ -390,13 +367,13 @@ pub fn tool_finished_metadata(tool_name: &str, extra: Option<Value>) -> Option<V
     Some(Value::Object(metadata))
 }
 
-pub fn provider_fallback_text(tool_name: &str, guide: Option<&str>, task: Option<&str>) -> String {
-    let guide = guide.unwrap_or("no-guide");
+pub fn provider_fallback_text(tool_name: &str, task: Option<&str>) -> String {
     let task = task.unwrap_or("no-task");
     match tool_name {
-        TOOL_SPAWN_BRANCH_PROCESS => format!("branch_result: {task} | guide={guide}"),
-        TOOL_MAKE_PLAN => format!("plan_proposal: {task} | guide={guide}"),
-        TOOL_REPAIR_PLAN => format!("repair_plan: {task} | guide={guide}"),
-        _ => format!("tool_result: {task} | guide={guide}"),
+        TOOL_SPAWN_BRANCH_PROCESS => format!("branch_result: {task}"),
+        TOOL_VIEW_PLAN => format!("view_plan: {task}"),
+        TOOL_ADD_PLAN => format!("add_plan: {task}"),
+        TOOL_DEL_PLAN => format!("del_plan: {task}"),
+        _ => format!("tool_result: {task}"),
     }
 }

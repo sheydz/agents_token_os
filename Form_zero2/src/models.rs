@@ -145,10 +145,51 @@ pub struct CompiledPrefixSuffixDefinite {
     pub suffix_segments: Vec<SegmentRow>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeContextRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl RuntimeContextRole {
+    pub fn as_provider_role(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeContextLayer {
+    Prefix,
+    Suffix,
+    ProcessPrompt,
+    ProcessStream,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeContextMessage {
+    pub role: RuntimeContextRole,
+    pub content: String,
+    pub context_layer: RuntimeContextLayer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_kind: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeHead {
     pub process_id: Uuid,
-    pub full_text: String,
+    pub full_context: Vec<RuntimeContextMessage>,
+    pub estimated_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -368,6 +409,8 @@ pub struct SlotPlanState {
 pub struct ProgramPlanState {
     pub plan_version: i64,
     pub global_phase: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub process_context_lengths: HashMap<String, usize>,
     pub slots: HashMap<String, SlotPlanState>,
 }
 
@@ -529,32 +572,94 @@ pub fn concatenate_segment_contents(segments: &[SegmentRow]) -> String {
     out
 }
 
-pub fn assemble_runtime_text(
-    built_all_text: &str,
+pub fn approximate_runtime_context_tokens(messages: &[RuntimeContextMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| approximate_token_count(&message.content) as usize + 4)
+        .sum()
+}
+
+fn runtime_context_message(
+    role: RuntimeContextRole,
+    context_layer: RuntimeContextLayer,
+    content: impl Into<String>,
+    process_id: Option<Uuid>,
+    io_kind: Option<&str>,
+) -> RuntimeContextMessage {
+    RuntimeContextMessage {
+        role,
+        content: content.into(),
+        context_layer,
+        process_id,
+        slot_name: None,
+        io_kind: io_kind.map(ToOwned::to_owned),
+    }
+}
+
+pub fn assemble_runtime_full_context(
+    process_id: Uuid,
+    prefix_segments: &[SegmentRow],
+    suffix_segments: &[SegmentRow],
     process_prompt_text: &str,
     process_segments: &[SegmentRow],
     open_live_segment: Option<&SegmentRow>,
-) -> String {
-    // Runtime head is the provider-facing head text: compiled prompt, then the mutable
-    // process prompt layer, then the visible process stream.
-    let process_text = concatenate_segment_contents(process_segments);
-    let open_text_len = open_live_segment
-        .map(|segment| segment.content.len())
-        .unwrap_or_default();
-    let mut combined = String::with_capacity(
-        built_all_text.len() + process_prompt_text.len() + process_text.len() + open_text_len + 80,
+) -> RuntimeHead {
+    let mut full_context = Vec::with_capacity(
+        prefix_segments.len() + suffix_segments.len() + process_segments.len() + 2,
     );
-    combined.push_str(built_all_text);
-    combined.push_str("\n\n[process_prompt]\n");
-    combined.push_str(process_prompt_text);
-    if !process_text.is_empty() || open_live_segment.is_some() {
-        combined.push_str("\n\n[process_stream]\n");
-        combined.push_str(&process_text);
+
+    for segment in prefix_segments {
+        full_context.push(runtime_context_message(
+            RuntimeContextRole::System,
+            RuntimeContextLayer::Prefix,
+            segment.content.clone(),
+            None,
+            None,
+        ));
     }
+    for segment in suffix_segments {
+        full_context.push(runtime_context_message(
+            RuntimeContextRole::Assistant,
+            RuntimeContextLayer::Suffix,
+            segment.content.clone(),
+            None,
+            None,
+        ));
+    }
+
+    full_context.push(runtime_context_message(
+        RuntimeContextRole::User,
+        RuntimeContextLayer::ProcessPrompt,
+        process_prompt_text.to_string(),
+        Some(process_id),
+        Some("prompt"),
+    ));
+
+    for segment in process_segments {
+        full_context.push(runtime_context_message(
+            RuntimeContextRole::Assistant,
+            RuntimeContextLayer::ProcessStream,
+            segment.content.clone(),
+            Some(process_id),
+            Some("stream"),
+        ));
+    }
+
     if let Some(segment) = open_live_segment {
-        combined.push_str(&segment.content);
+        full_context.push(runtime_context_message(
+            RuntimeContextRole::Assistant,
+            RuntimeContextLayer::ProcessStream,
+            segment.content.clone(),
+            Some(process_id),
+            Some("stream"),
+        ));
     }
-    combined
+
+    RuntimeHead {
+        process_id,
+        estimated_tokens: approximate_runtime_context_tokens(&full_context),
+        full_context,
+    }
 }
 
 pub fn compile_version_from_patch(patch: Option<&Value>) -> Option<i64> {
@@ -652,6 +757,7 @@ pub fn default_program_plan_state(workflow_json: &Value) -> ProgramPlanState {
     ProgramPlanState {
         plan_version: 1,
         global_phase: "running".to_string(),
+        process_context_lengths: HashMap::new(),
         slots,
     }
 }
@@ -1202,14 +1308,61 @@ mod tests {
     }
 
     #[test]
-    fn runtime_head_includes_process_prompt_before_process_stream() {
+    fn runtime_head_full_context_uses_expected_role_order() {
+        let process_id = Uuid::new_v4();
+        let prefix_segments = vec![segment(
+            OwnerKind::PrefixSuffixDefinite,
+            1,
+            Some(DefinitionPart::Prefix),
+            "SYSTEM",
+        )];
+        let suffix_segments = vec![segment(
+            OwnerKind::PrefixSuffixDefinite,
+            1,
+            Some(DefinitionPart::Suffix),
+            "ASSISTANT",
+        )];
         let process_segments = vec![
             segment(OwnerKind::Process, 1, None, "hello"),
             segment(OwnerKind::Process, 2, None, " world"),
         ];
+        let runtime_head = assemble_runtime_full_context(
+            process_id,
+            &prefix_segments,
+            &suffix_segments,
+            "REMINDER",
+            &process_segments,
+            None,
+        );
+
+        assert_eq!(runtime_head.full_context.len(), 5);
+        assert_eq!(runtime_head.full_context[0].role, RuntimeContextRole::System);
         assert_eq!(
-            assemble_runtime_text("PREFIX", "REMINDER", &process_segments, None),
-            "PREFIX\n\n[process_prompt]\nREMINDER\n\n[process_stream]\nhello world"
+            runtime_head.full_context[0].context_layer,
+            RuntimeContextLayer::Prefix
+        );
+        assert_eq!(
+            runtime_head.full_context[1].role,
+            RuntimeContextRole::Assistant
+        );
+        assert_eq!(
+            runtime_head.full_context[1].context_layer,
+            RuntimeContextLayer::Suffix
+        );
+        assert_eq!(runtime_head.full_context[2].role, RuntimeContextRole::User);
+        assert_eq!(
+            runtime_head.full_context[2].context_layer,
+            RuntimeContextLayer::ProcessPrompt
+        );
+        assert_eq!(runtime_head.full_context[3].role, RuntimeContextRole::Assistant);
+        assert_eq!(
+            runtime_head.full_context[3].context_layer,
+            RuntimeContextLayer::ProcessStream
+        );
+        assert_eq!(runtime_head.full_context[3].content, "hello");
+        assert_eq!(
+            runtime_head.full_context[4].context_layer,
+            RuntimeContextLayer::ProcessStream
         );
     }
 
@@ -1284,6 +1437,7 @@ mod tests {
         });
         let state = default_program_plan_state(&workflow_json);
         assert_eq!(state.plan_version, 1);
+        assert!(state.process_context_lengths.is_empty());
         assert!(state.slots.contains_key("writer1"));
         assert!(state.slots.contains_key("planner1"));
         assert_eq!(

@@ -7,7 +7,7 @@ use tokio_postgres::{Client, NoTls, Row};
 use uuid::Uuid;
 
 use crate::models::{
-    approximate_token_count, assemble_runtime_text, compensation_records_from_metadata,
+    approximate_token_count, assemble_runtime_full_context, compensation_records_from_metadata,
     compile_version_from_patch, concatenate_segment_contents, default_program_plan_state,
     merge_patch, metadata_with_compensation_records, runtime_state_from_patch, with_runtime_state,
     workflow_seed_slots, BoundProcessRow, CompiledPrefixSuffixDefinite, DefinitionPart, OwnerKind,
@@ -22,6 +22,12 @@ const SCORE_JUDGE_PROCESS_PROMPT: &str = "You are __score_judge__. You watch abn
 #[derive(Clone)]
 pub struct Database {
     client: Arc<Mutex<Client>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProgramLengthRefreshOutcome {
+    pub total_context_length: usize,
+    pub should_trigger_global_reprompt: bool,
 }
 
 impl Database {
@@ -1466,6 +1472,8 @@ impl Database {
                 .context("failed to commit create_program transaction")?;
         }
 
+        self.rebuild_program_process_context_lengths(program_run_id)
+            .await?;
         self.get_program(program_run_id).await
     }
 
@@ -1555,6 +1563,178 @@ impl Database {
         };
 
         map_program_row(&row)
+    }
+
+    pub async fn set_program_global_phase(
+        &self,
+        program_run_id: &str,
+        global_phase: &str,
+    ) -> Result<ProgramRow> {
+        let phase = global_phase.to_string();
+        let (program, ()) = self
+            .update_program_plan_state_locked(program_run_id, move |plan_state| {
+                plan_state.global_phase = phase.clone();
+                Ok(())
+            })
+            .await?;
+        Ok(program)
+    }
+
+    pub async fn rebuild_program_process_context_lengths(
+        &self,
+        program_run_id: &str,
+    ) -> Result<ProgramRow> {
+        let bindings = self
+            .list_process_instances_for_program_run(program_run_id)
+            .await?;
+        let mut lengths = HashMap::new();
+        for bound in bindings {
+            lengths.insert(
+                process_context_length_key(bound.process.id),
+                self.load_runtime_head(bound.process.id)
+                    .await?
+                    .estimated_tokens,
+            );
+        }
+
+        let (program, ()) = self
+            .update_program_plan_state_locked(program_run_id, move |plan_state| {
+                plan_state.process_context_lengths = lengths.clone();
+                Ok(())
+            })
+            .await?;
+        Ok(program)
+    }
+
+    pub async fn upsert_program_process_context_length(
+        &self,
+        program_run_id: &str,
+        process_id: Uuid,
+        context_length: usize,
+    ) -> Result<ProgramRow> {
+        let process_key = process_context_length_key(process_id);
+        let (program, ()) = self
+            .update_program_plan_state_locked(program_run_id, move |plan_state| {
+                plan_state
+                    .process_context_lengths
+                    .insert(process_key.clone(), context_length);
+                Ok(())
+            })
+            .await?;
+        Ok(program)
+    }
+
+    pub async fn remove_program_process_context_length(
+        &self,
+        program_run_id: &str,
+        process_id: Uuid,
+    ) -> Result<ProgramRow> {
+        let process_key = process_context_length_key(process_id);
+        let (program, ()) = self
+            .update_program_plan_state_locked(program_run_id, move |plan_state| {
+                plan_state.process_context_lengths.remove(&process_key);
+                Ok(())
+            })
+            .await?;
+        Ok(program)
+    }
+
+    pub(crate) async fn refresh_program_process_context_length(
+        &self,
+        program_run_id: &str,
+        process_id: Uuid,
+        context_length: usize,
+        reprompt_threshold: usize,
+    ) -> Result<ProgramLengthRefreshOutcome> {
+        let process_key = process_context_length_key(process_id);
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .context("failed to start refresh_program_process_context_length transaction")?;
+
+        let program_row = tx
+            .query_one(
+                r#"
+                SELECT
+                    program_run_id,
+                    workflow_definite_id,
+                    status,
+                    plan_state_json,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                FROM programs
+                WHERE program_run_id = $1
+                FOR UPDATE
+                "#,
+                &[&program_run_id],
+            )
+            .await
+            .with_context(|| format!("failed to lock program {program_run_id} for length refresh"))?;
+        let mut program = map_program_row(&program_row)?;
+
+        let process_still_bound = tx
+            .query_opt(
+                r#"
+                SELECT 1
+                FROM program_process_bindings
+                WHERE program_run_id = $1 AND process_id = $2
+                "#,
+                &[&program_run_id, &process_id],
+            )
+            .await
+            .context("failed to verify current program binding during length refresh")?
+            .is_some();
+
+        if process_still_bound {
+            program
+                .plan_state_json
+                .process_context_lengths
+                .insert(process_key, context_length);
+        } else {
+            program
+                .plan_state_json
+                .process_context_lengths
+                .remove(&process_key);
+        }
+
+        let total_context_length = program
+            .plan_state_json
+            .process_context_lengths
+            .values()
+            .copied()
+            .sum::<usize>();
+        let should_trigger_global_reprompt =
+            total_context_length >= reprompt_threshold
+                && program.plan_state_json.global_phase != "reprompt_running";
+        if should_trigger_global_reprompt {
+            program.plan_state_json.global_phase = "reprompt_running".to_string();
+        }
+
+        let encoded = serde_json::to_value(&program.plan_state_json)
+            .context("failed to encode refreshed process_context_lengths")?;
+        tx.execute(
+            r#"
+            UPDATE programs
+            SET
+                plan_state_json = $2,
+                updated_at = NOW()
+            WHERE program_run_id = $1
+            "#,
+            &[&program_run_id, &encoded],
+        )
+        .await
+        .with_context(|| format!("failed to persist context refresh for {program_run_id}"))?;
+
+        tx.commit()
+            .await
+            .context("failed to commit refresh_program_process_context_length transaction")?;
+
+        Ok(ProgramLengthRefreshOutcome {
+            total_context_length,
+            should_trigger_global_reprompt,
+        })
     }
 
     pub async fn update_program_metadata(
@@ -1709,6 +1889,9 @@ impl Database {
             .await
             .context("failed to commit bind_process_to_program transaction")?;
 
+        let context_length = self.load_runtime_head(process_id).await?.estimated_tokens;
+        self.upsert_program_process_context_length(program_run_id, process_id, context_length)
+            .await?;
         map_binding_row(&row)
     }
 
@@ -1736,7 +1919,13 @@ impl Database {
                 .context("failed to unbind process from program")?
         };
 
-        maybe_row.as_ref().map(map_binding_row).transpose()
+        if let Some(row) = maybe_row.as_ref().map(map_binding_row).transpose()? {
+            self.remove_program_process_context_length(&row.program_run_id, process_id)
+                .await?;
+            return Ok(Some(row));
+        }
+
+        Ok(None)
     }
 
     pub async fn terminate_process_instance(&self, process_id: Uuid) -> Result<ProcessInstanceRow> {
@@ -2294,16 +2483,19 @@ impl Database {
         let prefix_suffix = self
             .get_prefix_suffix_definite(process.prefix_suffix_definite_id)
             .await?;
-        let mut built_all = self
-            .fetch_built_all_segment(process.prefix_suffix_definite_id)
+        let (mut prefix_segments, mut suffix_segments, mut built_all) = self
+            .list_prefix_suffix_segments(process.prefix_suffix_definite_id)
             .await?;
 
         if built_all.is_none() || prefix_suffix.compile_status != "ready" {
             self.compile_prefix_suffix_definite(process.prefix_suffix_definite_id)
                 .await?;
-            built_all = self
-                .fetch_built_all_segment(process.prefix_suffix_definite_id)
+            let segments = self
+                .list_prefix_suffix_segments(process.prefix_suffix_definite_id)
                 .await?;
+            prefix_segments = segments.0;
+            suffix_segments = segments.1;
+            built_all = segments.2;
         }
 
         let built_all = built_all.ok_or_else(|| {
@@ -2316,16 +2508,14 @@ impl Database {
             compile_version_from_patch(built_all.patch.as_ref()).unwrap_or(0);
         let process_prompt = self.get_process_prompt(process_id).await?;
         let sealed_segments = self.list_sealed_process_segments(process_id).await?;
-        let full_text = assemble_runtime_text(
-            &built_all.content,
+        let runtime_head = assemble_runtime_full_context(
+            process_id,
+            &prefix_segments,
+            &suffix_segments,
             &process_prompt.prompt_text,
             &sealed_segments,
             None,
         );
-        let runtime_head = RuntimeHead {
-            process_id,
-            full_text,
-        };
 
         if built_all_compile_version == 0 {
             bail!("runtime head assembled from unversioned built_all segment");
@@ -2365,39 +2555,67 @@ impl Database {
         .await
     }
 
-    async fn fetch_built_all_segment(
+    async fn update_program_plan_state_locked<R, F>(
         &self,
-        prefix_suffix_definite_id: Uuid,
-    ) -> Result<Option<SegmentRow>> {
-        let maybe_row = {
-            let client = self.client.lock().await;
-            client
-                .query_opt(
-                    r#"
-                    SELECT
-                        id,
-                        owner_kind,
-                        owner_id,
-                        owner_seq,
-                        definition_part,
-                        segment_kind,
-                        content,
-                        token_count,
-                        tokenizer,
-                        patch,
-                        created_at
-                    FROM segment
-                    WHERE owner_kind = 'prefix_suffix_definite'
-                      AND owner_id = $1
-                      AND definition_part = 'built_all'
-                    "#,
-                    &[&prefix_suffix_definite_id],
-                )
-                .await
-                .context("failed to fetch built_all segment")?
-        };
-
-        maybe_row.as_ref().map(map_segment_row).transpose()
+        program_run_id: &str,
+        mutate: F,
+    ) -> Result<(ProgramRow, R)>
+    where
+        F: FnOnce(&mut ProgramPlanState) -> Result<R>,
+    {
+        let mut client = self.client.lock().await;
+        let tx = client
+            .transaction()
+            .await
+            .context("failed to start update_program_plan_state_locked transaction")?;
+        let row = tx
+            .query_one(
+                r#"
+                SELECT
+                    program_run_id,
+                    workflow_definite_id,
+                    status,
+                    plan_state_json,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                FROM programs
+                WHERE program_run_id = $1
+                FOR UPDATE
+                "#,
+                &[&program_run_id],
+            )
+            .await
+            .with_context(|| format!("failed to lock program {program_run_id}"))?;
+        let mut program = map_program_row(&row)?;
+        let result = mutate(&mut program.plan_state_json)?;
+        let encoded = serde_json::to_value(&program.plan_state_json)
+            .context("failed to encode locked plan_state_json")?;
+        let row = tx
+            .query_one(
+                r#"
+                UPDATE programs
+                SET
+                    plan_state_json = $2,
+                    updated_at = NOW()
+                WHERE program_run_id = $1
+                RETURNING
+                    program_run_id,
+                    workflow_definite_id,
+                    status,
+                    plan_state_json,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                "#,
+                &[&program_run_id, &encoded],
+            )
+            .await
+            .with_context(|| format!("failed to update locked program {program_run_id}"))?;
+        tx.commit()
+            .await
+            .context("failed to commit update_program_plan_state_locked transaction")?;
+        Ok((map_program_row(&row)?, result))
     }
 
     async fn next_external_slot_name(&self) -> Result<String> {
@@ -2496,6 +2714,10 @@ fn map_process_prompt_row(row: &Row) -> Result<ProcessPromptRow> {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
+}
+
+fn process_context_length_key(process_id: Uuid) -> String {
+    process_id.to_string()
 }
 
 fn map_segment_row(row: &Row) -> Result<SegmentRow> {

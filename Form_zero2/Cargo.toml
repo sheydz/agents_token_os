@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-path = "src copy/lib.rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "form_zero"
-path = "src copy/main.rs"
+path = "src/main.rs"
 
 [features]
 default = []
