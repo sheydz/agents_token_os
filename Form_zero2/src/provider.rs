@@ -80,6 +80,7 @@ struct OpenAiCompatibleEnvSpec {
     base_url_var: &'static str,
     model_var: &'static str,
     temperature_var: &'static str,
+    timeout_var: &'static str,
     default_base_url: &'static str,
     default_model: &'static str,
 }
@@ -107,9 +108,14 @@ impl OpenAiCompatibleBackend {
             .ok()
             .and_then(|value| value.parse::<f64>().ok())
             .unwrap_or(0.2);
+        let timeout_secs = std::env::var(spec.timeout_var)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(120);
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .context("failed to build OpenAI-compatible reqwest client")?;
 
@@ -277,6 +283,7 @@ impl OpenAiCompatibleProvider {
                 base_url_var: "FORM_ZERO_PROVIDER_BASE_URL",
                 model_var: "FORM_ZERO_PROVIDER_MODEL",
                 temperature_var: "FORM_ZERO_PROVIDER_TEMPERATURE",
+                timeout_var: "FORM_ZERO_PROVIDER_TIMEOUT_SECS",
                 default_base_url: "https://api.openai.com/v1",
                 default_model: "gpt-4o-mini",
             })?
@@ -314,6 +321,7 @@ impl OpenAiCompatibleTaskShotProvider {
                 base_url_var: "FORM_ZERO_PROVIDER2_BASE_URL",
                 model_var: "FORM_ZERO_PROVIDER2_MODEL",
                 temperature_var: "FORM_ZERO_PROVIDER2_TEMPERATURE",
+                timeout_var: "FORM_ZERO_PROVIDER2_TIMEOUT_SECS",
                 default_base_url: "https://api.openai.com/v1",
                 default_model: "gpt-4o-mini",
             })?
