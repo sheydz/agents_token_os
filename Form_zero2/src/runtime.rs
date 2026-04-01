@@ -22,29 +22,29 @@ use crate::{
     external_tools::ExternalToolRegistry,
     models::{
         approximate_runtime_context_tokens, approximate_token_count, default_program_slot_state,
-        merge_patch,
-        monitor_trigger_entries_from_value, with_runtime_state, DeliveryAction, HardwareStep,
-        MessageKind, MessageSourceKind, MonitorTriggerEntry, MonitorTriggerEvent, OwnerKind,
-        ProcessInstanceRow, ProcessPromptRow, ProcessRuntimeBinding, ProgramProcessBindingRow,
-        QueueBatchInfo, QueueEnvelope, ResultTarget, RuntimeContextLayer,
+        merge_patch, monitor_trigger_entries_from_value, with_runtime_state, DeliveryAction,
+        HardwareStep, MessageKind, MessageSourceKind, MonitorTriggerEntry, MonitorTriggerEvent,
+        OwnerKind, ProcessInstanceRow, ProcessPromptRow, ProcessRuntimeBinding,
+        ProgramProcessBindingRow, QueueBatchInfo, QueueEnvelope, ResultTarget, RuntimeContextLayer,
         RuntimeContextMessage, RuntimeContextRole, RuntimeHead, SegmentRow, StepKind, TaskStep,
         HIDDEN_OPTIMIZER_SLOT_NAME, HIDDEN_SCORE_JUDGE_SLOT_NAME,
     },
     peripherals::{build_external_tool_registry, peripherals_config_from_env, PeripheralsConfig},
-    provider::{default_provider_from_env, ProviderChunk, ProviderMessage, StreamingProvider},
+    provider::{
+        default_provider_from_env, default_task_shot_provider_from_env, ProviderChunk,
+        ProviderMessage, StreamingProvider, TaskShotProvider,
+    },
     tools::{
         blacklist_blocks_message, default_deadline_ms, target_selector_from_value,
-        tool_finished_metadata, tool_requires_provider, tool_result_patch,
-        upsert_blacklist_entry, BlacklistEntry,
-        HardwareOperationRegistry, ToolRegistry, ToolRunRegistry, HARDWARE_OP_BOARD_INFO,
-        HARDWARE_OP_DEVICE_CAPABILITIES, HARDWARE_OP_FLASH_FIRMWARE, HARDWARE_OP_GPIO_READ,
-        HARDWARE_OP_GPIO_WRITE, HARDWARE_OP_PROBE_READ_MEMORY, HARDWARE_OP_SERIAL_QUERY,
-        HARDWARE_OP_SERIAL_WRITE, TOOL_ADD_PLAN, TOOL_APPEND_OUTPUT_REF, TOOL_CREATE_PROGRAM,
-        TOOL_DEL_PLAN,
-        TOOL_DELETE_RESULT_ARTIFACT, TOOL_HISTORY_ANNOTATE, TOOL_HISTORY_QUERY,
-        TOOL_INSPECT_PROCESS_TABLE, TOOL_INVISIBLE_PROCESS, TOOL_MONITOR_EVENT_SEQUENCE,
-        TOOL_SPAWN_BRANCH_PROCESS, TOOL_VIEW_PLAN,
-        TOOL_SPAWN_REAL_PROCESS, TOOL_TERMINATE_PROCESS,
+        tool_finished_metadata, tool_requires_provider, tool_result_patch, upsert_blacklist_entry,
+        BlacklistEntry, HardwareOperationRegistry, ToolRegistry, ToolRunRegistry,
+        HARDWARE_OP_BOARD_INFO, HARDWARE_OP_DEVICE_CAPABILITIES, HARDWARE_OP_FLASH_FIRMWARE,
+        HARDWARE_OP_GPIO_READ, HARDWARE_OP_GPIO_WRITE, HARDWARE_OP_PROBE_READ_MEMORY,
+        HARDWARE_OP_SERIAL_QUERY, HARDWARE_OP_SERIAL_WRITE, TOOL_ADD_PLAN, TOOL_APPEND_OUTPUT_REF,
+        TOOL_CREATE_PROGRAM, TOOL_DELETE_RESULT_ARTIFACT, TOOL_DEL_PLAN, TOOL_HISTORY_ANNOTATE,
+        TOOL_HISTORY_QUERY, TOOL_INSPECT_PROCESS_TABLE, TOOL_INVISIBLE_PROCESS,
+        TOOL_MONITOR_EVENT_SEQUENCE, TOOL_SPAWN_BRANCH_PROCESS, TOOL_SPAWN_REAL_PROCESS,
+        TOOL_TERMINATE_PROCESS, TOOL_VIEW_PLAN,
     },
 };
 
@@ -60,9 +60,7 @@ const PROVIDER_STREAM_SEGMENT_KIND: &str = SEND_SEGMENT_KIND;
 const PROVIDER_STREAM_TOKENIZER: &str = "whitespace";
 const PERSISTED_FLUSH_INTERVAL_MS: u64 = 500;
 const SCORE_JUDGE_INTERVAL_MS: u64 = 10_000;
-const HIDDEN_SCORE_JUDGE_TOOL_NAME: &str = "__score_judge_call__";
 const HIDDEN_OPTIMIZER_TOOL_NAME: &str = "__optimizer_call__";
-const HIDDEN_REPROMPT_TOOL_NAME: &str = "__optimizer_reprompt__";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -866,6 +864,23 @@ struct ProviderGeneration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskShotKind {
+    ScoreJudge,
+    DeliveryJudge,
+    GlobalReprompt,
+}
+
+impl TaskShotKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ScoreJudge => "score_judge",
+            Self::DeliveryJudge => "delivery_judge",
+            Self::GlobalReprompt => "global_reprompt",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptAdoptionDecision {
     Promote,
     Rollback,
@@ -899,25 +914,11 @@ fn parse_mean_score_line(line: &str) -> Option<f64> {
         .and_then(|value| value.parse::<f64>().ok())
 }
 
-#[cfg(test)]
 fn parse_mean_score(output: &str) -> Result<f64> {
     output
         .lines()
         .find_map(parse_mean_score_line)
         .ok_or_else(|| anyhow!("score_judge output missing parseable `mean_score:` line"))
-}
-
-fn parse_latest_mean_score(runtime_head: &RuntimeHead) -> Result<f64> {
-    runtime_head
-        .full_context
-        .iter()
-        .rev()
-        .filter(|message| {
-            message.role == RuntimeContextRole::Assistant
-                && message.context_layer == RuntimeContextLayer::ProcessStream
-        })
-        .find_map(|message| message.content.lines().rev().find_map(parse_mean_score_line))
-        .ok_or_else(|| anyhow!("score_judge history missing parseable `mean_score:` line"))
 }
 
 fn is_plan_monitor_trigger(trigger: &MonitorTriggerEntry) -> bool {
@@ -960,7 +961,10 @@ fn parse_loose_json_value(output: &str) -> Result<Value> {
             .first()
             .map(|line| line.trim_start().starts_with("```"))
             .unwrap_or(false)
-        && lines.last().map(|line| line.trim() == "```").unwrap_or(false)
+        && lines
+            .last()
+            .map(|line| line.trim() == "```")
+            .unwrap_or(false)
     {
         let fenced_body = lines[1..lines.len() - 1].join("\n");
         if let Ok(parsed) = serde_json::from_str(fenced_body.trim()) {
@@ -1001,7 +1005,11 @@ fn parse_env_bool_flag(value: Option<String>) -> bool {
 }
 
 fn global_reprompt_includes_slot_for_mode(include_hidden: bool, slot_name: &str) -> bool {
-    include_hidden || !matches!(slot_name, HIDDEN_OPTIMIZER_SLOT_NAME | HIDDEN_SCORE_JUDGE_SLOT_NAME)
+    include_hidden
+        || !matches!(
+            slot_name,
+            HIDDEN_OPTIMIZER_SLOT_NAME | HIDDEN_SCORE_JUDGE_SLOT_NAME
+        )
 }
 
 #[derive(Clone, Default)]
@@ -1434,7 +1442,9 @@ struct ProcessMailbox {
 
 impl ProcessMailbox {
     fn new() -> Self {
-        Self { lanes: HashMap::new() }
+        Self {
+            lanes: HashMap::new(),
+        }
     }
 
     fn enqueue(&mut self, envelope: QueueEnvelope) -> QueueBatchInfo {
@@ -2775,6 +2785,7 @@ pub struct RuntimeEngine {
     hardware_device_gates: HardwareDeviceGateRegistry,
     hardware_exec_tx: mpsc::UnboundedSender<HardwareExecutionRequest>,
     provider: Arc<dyn StreamingProvider>,
+    task_shot_provider: Arc<dyn TaskShotProvider>,
     provider_input_budget: usize,
     compaction_trigger_ratio: f32,
     global_reprompt_include_hidden: bool,
@@ -2785,13 +2796,26 @@ impl RuntimeEngine {
     pub async fn new(db: Database, config: RuntimeConfig) -> Result<Self> {
         let provider = default_provider_from_env()?
             .ok_or_else(|| anyhow!("FORM_ZERO provider is required for runtime startup"))?;
-        Self::new_with_provider(db, config, provider).await
+        let task_shot_provider = default_task_shot_provider_from_env()?
+            .ok_or_else(|| anyhow!("FORM_ZERO provider2 is required for runtime startup"))?;
+        Self::new_with_providers(db, config, provider, task_shot_provider).await
     }
 
     pub async fn new_with_provider(
         db: Database,
         config: RuntimeConfig,
         provider: Arc<dyn StreamingProvider>,
+    ) -> Result<Self> {
+        let task_shot_provider = default_task_shot_provider_from_env()?
+            .ok_or_else(|| anyhow!("FORM_ZERO provider2 is required for runtime startup"))?;
+        Self::new_with_providers(db, config, provider, task_shot_provider).await
+    }
+
+    pub async fn new_with_providers(
+        db: Database,
+        config: RuntimeConfig,
+        provider: Arc<dyn StreamingProvider>,
+        task_shot_provider: Arc<dyn TaskShotProvider>,
     ) -> Result<Self> {
         let live_bus_registry = LiveBusRegistry::default();
         let ephemeral_live_bus_registry = EphemeralLiveBusRegistry::default();
@@ -2843,6 +2867,7 @@ impl RuntimeEngine {
             hardware_device_gates,
             hardware_exec_tx,
             provider,
+            task_shot_provider,
             provider_input_budget: config.provider_input_budget,
             compaction_trigger_ratio: config.compaction_trigger_ratio,
             global_reprompt_include_hidden: config.global_reprompt_include_hidden,
@@ -3603,6 +3628,66 @@ impl RuntimeEngine {
         Ok(())
     }
 
+    async fn run_task_shot(
+        &self,
+        kind: TaskShotKind,
+        source: &ProcessRuntimeBinding,
+        snapshot_runtime_head: &RuntimeHead,
+        task_user_message: ProviderMessage,
+    ) -> Result<String> {
+        let source_process_id = source.process.id;
+        let program_run_id = source
+            .binding
+            .as_ref()
+            .map(|binding| binding.program_run_id.clone())
+            .unwrap_or_else(|| "unbound".to_string());
+        let stream_id = Uuid::new_v4();
+        let messages = render_provider_messages(snapshot_runtime_head, Some(task_user_message));
+        self.task_shot_provider
+            .complete_text(messages)
+            .await
+            .with_context(|| {
+                format!(
+                    "provider2 {} failed for source_process {} program {} stream {}",
+                    kind.as_str(),
+                    source_process_id,
+                    program_run_id,
+                    stream_id
+                )
+            })
+    }
+
+    async fn run_score_judge_task_shot(&self, program_run_id: &str) -> Result<f64> {
+        let score_judge = self
+            .resolve_hidden_process(program_run_id, HIDDEN_SCORE_JUDGE_SLOT_NAME)
+            .await?;
+        let optimizer = self
+            .resolve_hidden_process(program_run_id, HIDDEN_OPTIMIZER_SLOT_NAME)
+            .await?;
+        let snapshot_runtime_head = resident_runtime_head(
+            &self.db,
+            &self.live_bus_registry,
+            &self.runtime_head_registry,
+            score_judge.process.id,
+        )
+        .await?;
+        let score_text = self
+            .run_task_shot(
+                TaskShotKind::ScoreJudge,
+                &score_judge,
+                &snapshot_runtime_head,
+                ProviderMessage::user(
+                    "Please score the current task's known message network from your runtime head. Output only two lines: `mean_score: <number>` and `note: <short text>`.",
+                ),
+            )
+            .await?;
+        let mean_score = parse_mean_score(&score_text)
+            .with_context(|| format!("score_judge returned unparseable output: {score_text:?}"))?;
+        self.dispatch_system_message_direct(&score_judge, &optimizer, "score_update", score_text)
+            .await?;
+        Ok(mean_score)
+    }
+
     async fn run_hidden_process_generation(
         &self,
         hidden: &ProcessRuntimeBinding,
@@ -3674,24 +3759,7 @@ impl RuntimeEngine {
     }
 
     async fn run_periodic_score_for_program(&self, program_run_id: &str) -> Result<()> {
-        let score_judge = self
-            .resolve_hidden_process(program_run_id, HIDDEN_SCORE_JUDGE_SLOT_NAME)
-            .await?;
-        let optimizer = self
-            .resolve_hidden_process(program_run_id, HIDDEN_OPTIMIZER_SLOT_NAME)
-            .await?;
-
-        let score_text = self
-            .run_hidden_process_generation(
-                &score_judge,
-                HIDDEN_SCORE_JUDGE_TOOL_NAME,
-                Some(ProviderMessage::user(
-                    "Please score the current task's known message network from your runtime head. Output only two lines: `mean_score: <number>` and `note: <short text>`.",
-                )),
-            )
-            .await?;
-        self.dispatch_system_message_direct(&score_judge, &optimizer, "score_update", score_text)
-            .await?;
+        let _ = self.run_score_judge_task_shot(program_run_id).await?;
         Ok(())
     }
 
@@ -4107,20 +4175,12 @@ impl RuntimeEngine {
             return Ok(());
         }
 
-        let score_judge = self
-            .resolve_hidden_process(&binding.program_run_id, HIDDEN_SCORE_JUDGE_SLOT_NAME)
+        let mean_score = self
+            .run_score_judge_task_shot(&binding.program_run_id)
             .await?;
         let optimizer = self
             .resolve_hidden_process(&binding.program_run_id, HIDDEN_OPTIMIZER_SLOT_NAME)
             .await?;
-        let score_runtime_head = resident_runtime_head(
-            &self.db,
-            &self.live_bus_registry,
-            &self.runtime_head_registry,
-            score_judge.process.id,
-        )
-        .await?;
-        let mean_score = parse_latest_mean_score(&score_runtime_head)?;
 
         for (prompt_binding, prompt) in &active_prompts {
             let content = format!(
@@ -4154,13 +4214,21 @@ impl RuntimeEngine {
         )
         .await?;
 
+        let optimizer_runtime_head = resident_runtime_head(
+            &self.db,
+            &self.live_bus_registry,
+            &self.runtime_head_registry,
+            optimizer.process.id,
+        )
+        .await?;
         let output = self
-            .run_hidden_process_generation(
+            .run_task_shot(
+                TaskShotKind::GlobalReprompt,
                 &optimizer,
-                HIDDEN_REPROMPT_TOOL_NAME,
-                Some(ProviderMessage::user(
+                &optimizer_runtime_head,
+                ProviderMessage::user(
                     "Rewrite the current process prompts for this program. Output only blocks in this exact format: `@@process <process_id>` on its own line, then the full prompt text, then `@@end` on its own line. Do not output anything else.",
-                )),
+                ),
             )
             .await?;
         let reprompt_blocks = parse_reprompt_blocks(&output)?;
@@ -4376,17 +4444,29 @@ impl RuntimeEngine {
             .as_ref()
             .map(|binding| binding.program_slot_name.as_str())
             .unwrap_or(target.process.external_slot_name.as_str());
-        let messages = vec![ProviderMessage::user(format!(
-            "Return JSON only with keys `final_priority`, `final_delivery_action`, and optional `bounce_hint`.\nAllowed actions: interrupt_deliver, persistent_async_clone, segment_boundary_deliver, ephemeral_async_clone, bounce_with_hint, ignore, blacklist_sender.\nsender_slot: {}\ntarget_slot: {}\nmessage_kind: {}\nbase_priority: {}\nrequested_delivery_action: {}\ncontent: {}",
-            sender_slot,
-            target_slot,
-            message_kind.as_str(),
-            base_priority,
-            requested_delivery_action.as_str(),
-            content.unwrap_or(""),
-        ))];
-        let (chunk_tx, _chunk_rx) = mpsc::unbounded_channel();
-        let output = self.provider.stream_text(messages, chunk_tx).await?;
+        let target_runtime_head = resident_runtime_head(
+            &self.db,
+            &self.live_bus_registry,
+            &self.runtime_head_registry,
+            target.process.id,
+        )
+        .await?;
+        let output = self
+            .run_task_shot(
+                TaskShotKind::DeliveryJudge,
+                target,
+                &target_runtime_head,
+                ProviderMessage::user(format!(
+                    "Return JSON only with keys `final_priority`, `final_delivery_action`, and optional `bounce_hint`.\nAllowed actions: interrupt_deliver, persistent_async_clone, segment_boundary_deliver, ephemeral_async_clone, bounce_with_hint, ignore, blacklist_sender.\nsender_slot: {}\ntarget_slot: {}\nmessage_kind: {}\nbase_priority: {}\nrequested_delivery_action: {}\ncontent: {}",
+                    sender_slot,
+                    target_slot,
+                    message_kind.as_str(),
+                    base_priority,
+                    requested_delivery_action.as_str(),
+                    content.unwrap_or(""),
+                )),
+            )
+            .await?;
         let parsed =
             parse_loose_json_value(&output).context("delivery judge must return valid JSON")?;
         let final_priority = parsed
@@ -5028,7 +5108,8 @@ impl RuntimeEngine {
         })?;
         let program_slot_name = required_string(tool_args, "program_slot_name")
             .or_else(|_| required_string(tool_args, "slot_name"))?;
-        let explicit_prefix_suffix_definite_id = optional_uuid(tool_args, "prefix_suffix_definite_id");
+        let explicit_prefix_suffix_definite_id =
+            optional_uuid(tool_args, "prefix_suffix_definite_id");
         let status = optional_string(tool_args, "status").unwrap_or_else(|| "running".to_string());
         let parent_slot = optional_string(tool_args, "parent_slot")
             .or_else(|| Some(host_binding.program_slot_name.clone()));
@@ -5583,7 +5664,13 @@ impl RuntimeEngine {
             .plan_state_json
             .slots
             .get(&slot_name)
-            .ok_or_else(|| anyhow!("program slot {} not found in {}", slot_name, binding.program_run_id))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "program slot {} not found in {}",
+                    slot_name,
+                    binding.program_run_id
+                )
+            })?;
         let entries = slot_state
             .monitor_triggers
             .iter()
@@ -5624,7 +5711,11 @@ impl RuntimeEngine {
 
         let mut program = self.db.get_program(&binding.program_run_id).await?;
         if !program.plan_state_json.slots.contains_key(&slot_name) {
-            bail!("program slot {} not found in {}", slot_name, binding.program_run_id);
+            bail!(
+                "program slot {} not found in {}",
+                slot_name,
+                binding.program_run_id
+            );
         }
         if !program.plan_state_json.slots.contains_key(&target_slot) {
             bail!(
@@ -5671,8 +5762,12 @@ impl RuntimeEngine {
             .update_program_plan_state(&binding.program_run_id, &program.plan_state_json)
             .await?;
 
-        self.tool_view_plan(host, tool_run_id, &json!({ "program_slot_name": slot_name }))
-            .await
+        self.tool_view_plan(
+            host,
+            tool_run_id,
+            &json!({ "program_slot_name": slot_name }),
+        )
+        .await
     }
 
     async fn tool_del_plan(
@@ -5694,7 +5789,13 @@ impl RuntimeEngine {
             .plan_state_json
             .slots
             .get_mut(&slot_name)
-            .ok_or_else(|| anyhow!("program slot {} not found in {}", slot_name, binding.program_run_id))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "program slot {} not found in {}",
+                    slot_name,
+                    binding.program_run_id
+                )
+            })?;
 
         let existing_ids = slot_state
             .monitor_triggers
@@ -5712,7 +5813,8 @@ impl RuntimeEngine {
         }
 
         slot_state.monitor_triggers.retain(|trigger| {
-            !(is_plan_monitor_trigger(trigger) && trigger_ids.iter().any(|id| id == &trigger.trigger_id))
+            !(is_plan_monitor_trigger(trigger)
+                && trigger_ids.iter().any(|id| id == &trigger.trigger_id))
         });
         slot_state.updated_at = Utc::now();
         program.plan_state_json.plan_version += 1;
@@ -5720,8 +5822,12 @@ impl RuntimeEngine {
             .update_program_plan_state(&binding.program_run_id, &program.plan_state_json)
             .await?;
 
-        self.tool_view_plan(host, tool_run_id, &json!({ "program_slot_name": slot_name }))
-            .await
+        self.tool_view_plan(
+            host,
+            tool_run_id,
+            &json!({ "program_slot_name": slot_name }),
+        )
+        .await
     }
 
     async fn tool_append_output_ref(
@@ -6004,7 +6110,10 @@ fn required_string_array(value: &Value, key: &str) -> Result<Vec<String>> {
 }
 
 fn optional_u8(value: &Value, key: &str) -> Option<u8> {
-    value.get(key).and_then(Value::as_u64).and_then(|raw| u8::try_from(raw).ok())
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|raw| u8::try_from(raw).ok())
 }
 
 fn required_uuid(value: &Value, key: &str) -> Result<Uuid> {
@@ -6312,12 +6421,10 @@ mod tests {
             .get(stream_id)
             .await
             .expect("runtime head should exist");
-        assert!(
-            state
-                .full_context
-                .iter()
-                .any(|message| message.content.contains("[mailbox]\nhello"))
-        );
+        assert!(state
+            .full_context
+            .iter()
+            .any(|message| message.content.contains("[mailbox]\nhello")));
 
         let live_segment = live_bus_registry
             .get(stream_id)
@@ -6396,34 +6503,6 @@ mod tests {
     #[test]
     fn parse_mean_score_reads_numeric_line() {
         let parsed = parse_mean_score("mean_score: 8.5\nnote: stable").expect("score should parse");
-        assert_eq!(parsed, 8.5);
-    }
-
-    #[test]
-    fn parse_latest_mean_score_reads_last_numeric_line() {
-        let parsed = parse_latest_mean_score(&RuntimeHead {
-            process_id: Uuid::new_v4(),
-            full_context: vec![
-                RuntimeContextMessage {
-                    role: RuntimeContextRole::Assistant,
-                    content: "mean_score: 7.0\nnote: earlier".to_string(),
-                    context_layer: RuntimeContextLayer::ProcessStream,
-                    process_id: None,
-                    slot_name: None,
-                    io_kind: None,
-                },
-                RuntimeContextMessage {
-                    role: RuntimeContextRole::Assistant,
-                    content: "mean_score: 8.5\nnote: latest".to_string(),
-                    context_layer: RuntimeContextLayer::ProcessStream,
-                    process_id: None,
-                    slot_name: None,
-                    io_kind: None,
-                },
-            ],
-            estimated_tokens: 12,
-        })
-        .expect("latest score should parse");
         assert_eq!(parsed, 8.5);
     }
 

@@ -14,17 +14,16 @@ pub use external_tools::{
 };
 pub use models::{
     approximate_runtime_context_tokens, approximate_token_count, assemble_runtime_full_context,
-    compensation_records_from_metadata, concatenate_segment_contents,
-    default_program_plan_state, default_program_slot_state, default_step_entry,
-    metadata_with_compensation_records, monitor_trigger_entries_from_value,
-    step_entries_from_value, workflow_seed_slots, BoundProcessRow, CompiledPrefixSuffixDefinite,
-    DefinitionPart, DeliveryAction, HardwareStep, MessageBatchInfo, MessageKind,
-    MessageSourceKind, MonitorTriggerEntry, MonitorTriggerEvent, OwnerKind,
-    PersistenceCompensationRecord, PrefixSuffixDefiniteRow, ProcessInstanceRow,
+    compensation_records_from_metadata, concatenate_segment_contents, default_program_plan_state,
+    default_program_slot_state, default_step_entry, metadata_with_compensation_records,
+    monitor_trigger_entries_from_value, step_entries_from_value, workflow_seed_slots,
+    BoundProcessRow, CompiledPrefixSuffixDefinite, DefinitionPart, DeliveryAction, HardwareStep,
+    MessageBatchInfo, MessageKind, MessageSourceKind, MonitorTriggerEntry, MonitorTriggerEvent,
+    OwnerKind, PersistenceCompensationRecord, PrefixSuffixDefiniteRow, ProcessInstanceRow,
     ProcessMessageEnvelope, ProcessRuntimeBinding, ProgramPlanState, ProgramProcessBindingRow,
     ProgramRow, QueueBatchInfo, QueueEnvelope, ResultTarget, RuntimeContextLayer,
-    RuntimeContextMessage, RuntimeContextRole, RuntimeHead, SegmentRow, SlotPlanState,
-    StepEntry, StepKind, TaskStep, WorkflowDefiniteRow, WorkflowSeedSlot, WorkflowSlotSpec,
+    RuntimeContextMessage, RuntimeContextRole, RuntimeHead, SegmentRow, SlotPlanState, StepEntry,
+    StepKind, TaskStep, WorkflowDefiniteRow, WorkflowSeedSlot, WorkflowSlotSpec,
     WorkflowTemplateSpec,
 };
 pub use peripherals::{
@@ -32,8 +31,9 @@ pub use peripherals::{
     PeripheralsConfig, FORM_ZERO_PERIPHERALS_JSON_ENV,
 };
 pub use provider::{
-    default_provider_from_env, OpenAiCompatibleProvider, ProviderChunk, ProviderMessage,
-    StaticStreamingProvider, StreamingProvider,
+    default_provider_from_env, default_task_shot_provider_from_env, OpenAiCompatibleProvider,
+    OpenAiCompatibleTaskShotProvider, ProviderChunk, ProviderMessage, StaticStreamingProvider,
+    StreamingProvider, TaskShotProvider,
 };
 pub use runtime::{
     GlobalMessageQueue, LiveBusRegistry, MonitorEventSequenceEngine, OpenLiveSegment,
@@ -42,7 +42,7 @@ pub use runtime::{
 };
 pub use tools::{
     blacklist_blocks_message, default_deadline_ms, provider_fallback_text,
-    target_selector_from_value, tool_finished_metadata, tool_requires_provider,
-    tool_result_patch, BlacklistEntry, HardwareOperationRegistry, ToolRegistry, ToolRunRecord,
-    ToolRunRegistry, ToolRunStatus,
+    target_selector_from_value, tool_finished_metadata, tool_requires_provider, tool_result_patch,
+    BlacklistEntry, HardwareOperationRegistry, ToolRegistry, ToolRunRecord, ToolRunRegistry,
+    ToolRunStatus,
 };

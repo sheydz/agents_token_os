@@ -1336,7 +1336,10 @@ mod tests {
         );
 
         assert_eq!(runtime_head.full_context.len(), 5);
-        assert_eq!(runtime_head.full_context[0].role, RuntimeContextRole::System);
+        assert_eq!(
+            runtime_head.full_context[0].role,
+            RuntimeContextRole::System
+        );
         assert_eq!(
             runtime_head.full_context[0].context_layer,
             RuntimeContextLayer::Prefix
@@ -1354,7 +1357,10 @@ mod tests {
             runtime_head.full_context[2].context_layer,
             RuntimeContextLayer::ProcessPrompt
         );
-        assert_eq!(runtime_head.full_context[3].role, RuntimeContextRole::Assistant);
+        assert_eq!(
+            runtime_head.full_context[3].role,
+            RuntimeContextRole::Assistant
+        );
         assert_eq!(
             runtime_head.full_context[3].context_layer,
             RuntimeContextLayer::ProcessStream

@@ -1186,12 +1186,13 @@ impl Database {
         let plan_state = default_program_plan_state(&workflow.workflow_json);
         let mut slot_prefixes = HashMap::new();
         for (slot_name, slot_state) in &plan_state.slots {
-            let prefix_suffix_definite_id = slot_state.prefix_suffix_definite_id.ok_or_else(|| {
-                anyhow!(
-                    "workflow slot {} missing prefix_suffix_definite_id",
-                    slot_name
-                )
-            })?;
+            let prefix_suffix_definite_id =
+                slot_state.prefix_suffix_definite_id.ok_or_else(|| {
+                    anyhow!(
+                        "workflow slot {} missing prefix_suffix_definite_id",
+                        slot_name
+                    )
+                })?;
             slot_prefixes.insert(slot_name.clone(), prefix_suffix_definite_id);
         }
 
@@ -1262,9 +1263,13 @@ impl Database {
                     bail!("process_instance {process_id} not found");
                 };
 
-                let expected_prefix_suffix_definite_id = slot_prefixes.get(slot_name).ok_or_else(
-                    || anyhow!("create_program received unknown workflow slot {}", slot_name),
-                )?;
+                let expected_prefix_suffix_definite_id =
+                    slot_prefixes.get(slot_name).ok_or_else(|| {
+                        anyhow!(
+                            "create_program received unknown workflow slot {}",
+                            slot_name
+                        )
+                    })?;
                 let actual_prefix_suffix_definite_id: Uuid =
                     process_row.get("prefix_suffix_definite_id");
                 if actual_prefix_suffix_definite_id != *expected_prefix_suffix_definite_id {
@@ -1292,7 +1297,9 @@ impl Database {
             let external_slot_rows = tx
                 .query("SELECT external_slot_name FROM process_instances", &[])
                 .await
-                .context("failed to list existing external_slot_name values inside create_program")?;
+                .context(
+                    "failed to list existing external_slot_name values inside create_program",
+                )?;
             let mut next_free_index = external_slot_rows
                 .iter()
                 .filter_map(|row| {
@@ -1684,7 +1691,9 @@ impl Database {
                 &[&program_run_id],
             )
             .await
-            .with_context(|| format!("failed to lock program {program_run_id} for length refresh"))?;
+            .with_context(|| {
+                format!("failed to lock program {program_run_id} for length refresh")
+            })?;
         let mut program = map_program_row(&program_row)?;
 
         let process_still_bound = tx
@@ -1718,9 +1727,8 @@ impl Database {
             .values()
             .copied()
             .sum::<usize>();
-        let should_trigger_global_reprompt =
-            total_context_length >= reprompt_threshold
-                && program.plan_state_json.global_phase != "reprompt_running";
+        let should_trigger_global_reprompt = total_context_length >= reprompt_threshold
+            && program.plan_state_json.global_phase != "reprompt_running";
         if should_trigger_global_reprompt {
             program.plan_state_json.global_phase = "reprompt_running".to_string();
         }
@@ -1833,8 +1841,7 @@ impl Database {
         let Some(process_row) = process_exists else {
             bail!("process_instance {process_id} not found");
         };
-        let actual_prefix_suffix_definite_id: Uuid =
-            process_row.get("prefix_suffix_definite_id");
+        let actual_prefix_suffix_definite_id: Uuid = process_row.get("prefix_suffix_definite_id");
         if actual_prefix_suffix_definite_id != expected_prefix_suffix_definite_id {
             bail!(
                 "program slot {} expects prefix_suffix_definite {} but process {} uses {}",
