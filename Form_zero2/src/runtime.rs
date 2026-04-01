@@ -980,7 +980,64 @@ fn parse_loose_json_value(output: &str) -> Result<Value> {
         }
     }
 
+    if let Some(parsed) = parse_loose_delivery_decision_fields(trimmed) {
+        return Ok(parsed);
+    }
+
     Err(anyhow!("output did not contain parseable JSON"))
+}
+
+fn parse_loose_delivery_decision_fields(output: &str) -> Option<Value> {
+    let final_delivery_action = extract_loose_delivery_action(output)?;
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "final_delivery_action".to_string(),
+        Value::String(final_delivery_action.as_str().to_string()),
+    );
+    if let Some(final_priority) = extract_loose_priority(output) {
+        map.insert(
+            "final_priority".to_string(),
+            Value::Number(serde_json::Number::from(final_priority)),
+        );
+    }
+    Some(Value::Object(map))
+}
+
+fn extract_loose_delivery_action(output: &str) -> Option<DeliveryAction> {
+    let normalized = output.to_ascii_lowercase();
+    let actions = [
+        DeliveryAction::InterruptDeliver,
+        DeliveryAction::PersistentAsyncClone,
+        DeliveryAction::SegmentBoundaryDeliver,
+        DeliveryAction::EphemeralAsyncClone,
+        DeliveryAction::BounceWithHint,
+        DeliveryAction::Ignore,
+        DeliveryAction::BlacklistSender,
+    ];
+
+    actions
+        .into_iter()
+        .filter_map(|action| normalized.rfind(action.as_str()).map(|index| (index, action)))
+        .max_by_key(|(index, _)| *index)
+        .map(|(_, action)| action)
+}
+
+fn extract_loose_priority(output: &str) -> Option<u8> {
+    for line in output.lines() {
+        let normalized = line.to_ascii_lowercase();
+        if !normalized.contains("priority") {
+            continue;
+        }
+        if let Some(priority) = normalized
+            .chars()
+            .filter_map(|ch| ch.to_digit(10))
+            .find_map(|digit| u8::try_from(digit).ok())
+            .filter(|priority| (1..=8).contains(priority))
+        {
+            return Some(priority);
+        }
+    }
+    None
 }
 
 fn decide_prompt_adoption(prompt: &ProcessPromptRow, mean_score: f64) -> PromptAdoptionDecision {
@@ -6556,6 +6613,28 @@ mod tests {
 
         assert_eq!(parsed["final_priority"], 5);
         assert_eq!(parsed["final_delivery_action"], "bounce_with_hint");
+    }
+
+    #[test]
+    fn parse_loose_json_value_detects_delivery_decision_from_plain_text() {
+        let parsed = parse_loose_json_value(
+            "Use final_priority 6. Best action: ephemeral_async_clone.",
+        )
+        .expect("plain-text delivery decision should parse");
+
+        assert_eq!(parsed["final_priority"], 6);
+        assert_eq!(parsed["final_delivery_action"], "ephemeral_async_clone");
+    }
+
+    #[test]
+    fn parse_loose_json_value_detects_last_delivery_action_token() {
+        let parsed = parse_loose_json_value(
+            "I considered interrupt_deliver first, but the final delivery_action should be ignore.",
+        )
+        .expect("plain-text action token should parse");
+
+        assert_eq!(parsed["final_delivery_action"], "ignore");
+        assert!(parsed.get("final_priority").is_none());
     }
 
     #[test]

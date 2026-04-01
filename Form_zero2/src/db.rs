@@ -1909,6 +1909,8 @@ impl Database {
             .await
             .context("failed to commit bind_process_to_program transaction")?;
 
+        drop(client);
+
         let context_length = self.load_runtime_head(process_id).await?.estimated_tokens;
         self.upsert_program_process_context_length(program_run_id, process_id, context_length)
             .await?;
