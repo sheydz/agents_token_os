@@ -10,6 +10,8 @@ use tokio::time::{sleep, Duration, Instant};
 
 const PHASE_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TOOL_RESULT_TIMEOUT: Duration = Duration::from_secs(60);
+const REPROMPT_START_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy)]
 struct StageSpec {
@@ -18,6 +20,9 @@ struct StageSpec {
     compaction_trigger_ratio: f32,
     max_probe_messages: usize,
     long_message_repeat: usize,
+    target_reprompt_cycles: usize,
+    enable_ephemeral_clone_probe: bool,
+    measure_score_trend: bool,
 }
 
 struct StageSetup {
@@ -31,17 +36,38 @@ struct PhaseObservation {
     final_phase: String,
 }
 
+struct ReplayObservation {
+    delivery_probes: Vec<Value>,
+    phase_observation: PhaseObservation,
+    reprompt_cycles: Vec<Value>,
+    post_reprompt_refill_seen: bool,
+    baseline_mean_score: Option<f64>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     mirror_provider2_env();
 
     let stage = match env::args().nth(1).as_deref() {
+        Some("stage_c") => StageSpec {
+            name: "stage_c",
+            provider_input_budget: 2_048,
+            compaction_trigger_ratio: 0.35,
+            max_probe_messages: 80,
+            long_message_repeat: 84,
+            target_reprompt_cycles: 20,
+            enable_ephemeral_clone_probe: true,
+            measure_score_trend: true,
+        },
         Some("stage_b") => StageSpec {
             name: "stage_b",
             provider_input_budget: 8_000,
             compaction_trigger_ratio: 0.7,
             max_probe_messages: 20,
             long_message_repeat: 140,
+            target_reprompt_cycles: 1,
+            enable_ephemeral_clone_probe: true,
+            measure_score_trend: false,
         },
         Some("stage_a") | None => StageSpec {
             name: "stage_a",
@@ -49,8 +75,11 @@ async fn main() -> Result<()> {
             compaction_trigger_ratio: 0.2,
             max_probe_messages: 10,
             long_message_repeat: 48,
+            target_reprompt_cycles: 1,
+            enable_ephemeral_clone_probe: false,
+            measure_score_trend: false,
         },
-        Some(other) => bail!("unknown stage `{other}`; use `stage_a` or `stage_b`"),
+        Some(other) => bail!("unknown stage `{other}`; use `stage_a`, `stage_b`, or `stage_c`"),
     };
 
     let database_url = env::var("FORM_ZERO_DATABASE_URL")
@@ -79,51 +108,13 @@ async fn main() -> Result<()> {
 
     let provider1_result_seen = run_persistent_branch_task(&runtime, &setup).await?;
 
-    let ephemeral_clone_seen = if stage.name == "stage_b" {
+    let ephemeral_clone_seen = if stage.enable_ephemeral_clone_probe {
         run_ephemeral_clone_task(&runtime, &setup).await?
     } else {
         false
     };
 
-    let mut delivery_probes = Vec::new();
-    let mut saw_reprompt_running = false;
-    for index in 0..stage.max_probe_messages {
-        let envelope = send_non_direct_probe(
-            &runtime,
-            &setup.program_run_id,
-            stage.name,
-            index,
-            stage.long_message_repeat,
-        )
-        .await?;
-        delivery_probes.push(json!({
-            "index": index,
-            "final_priority": envelope.final_priority,
-            "final_delivery_action": envelope.final_delivery_action.map(|value| value.as_str().to_string()),
-        }));
-        let phase = db
-            .get_program(&setup.program_run_id)
-            .await?
-            .plan_state_json
-            .global_phase;
-        println!(
-            "{} non-direct probe {} -> phase {}",
-            stage.name, index, phase
-        );
-        if phase == "reprompt_running" {
-            saw_reprompt_running = true;
-            break;
-        }
-        sleep(Duration::from_millis(350)).await;
-    }
-
-    let phase_observation = wait_for_phase_cycle(&db, &setup.program_run_id, saw_reprompt_running).await?;
-
-    let post_reprompt_refill_seen = if phase_observation.final_phase == "running" {
-        refill_lengths_after_reprompt(&db, &runtime, &setup).await?
-    } else {
-        false
-    };
+    let replay = run_reprompt_replay(&db, &runtime, &setup, stage).await?;
     let final_bindings = current_bindings(&db, &setup.program_run_id).await?;
     let final_prompt_versions = current_prompt_versions(&db, &setup.program_run_id).await?;
     let rotated_slots = rotated_normal_slots(&initial_bindings, &final_bindings);
@@ -165,13 +156,18 @@ async fn main() -> Result<()> {
         "compaction_trigger_ratio": stage.compaction_trigger_ratio,
         "provider1_result_seen": provider1_result_seen,
         "ephemeral_clone_result_seen": ephemeral_clone_seen,
-        "delivery_probes": delivery_probes,
+        "delivery_probes": replay.delivery_probes,
         "phase": {
-            "saw_reprompt_running": phase_observation.saw_reprompt_running,
-            "saw_empty_lengths_while_reprompt_running": phase_observation.saw_empty_lengths_while_reprompt_running,
-            "final_phase": phase_observation.final_phase,
+            "saw_reprompt_running": replay.phase_observation.saw_reprompt_running,
+            "saw_empty_lengths_while_reprompt_running": replay.phase_observation.saw_empty_lengths_while_reprompt_running,
+            "final_phase": replay.phase_observation.final_phase,
         },
-        "post_reprompt_refill_seen": post_reprompt_refill_seen,
+        "post_reprompt_refill_seen": replay.post_reprompt_refill_seen,
+        "reprompt_cycles": replay.reprompt_cycles,
+        "coordination_scores": summarize_scores(
+            replay.baseline_mean_score,
+            &replay.reprompt_cycles,
+        ),
         "rotated_normal_slots": rotated_slots,
         "initial_bindings": stringify_bindings(&initial_bindings),
         "final_bindings": stringify_bindings(&final_bindings),
@@ -212,11 +208,31 @@ fn mirror_env(src: &str, dst: &str) {
 
 async fn setup_program(db: &Database, stage_name: &str) -> Result<StageSetup> {
     let slot_defs = vec![
-        ("planner", "planner runtime", "planner suffix"),
-        ("writer", "writer runtime", "writer suffix"),
-        ("reviewer", "reviewer runtime", "reviewer suffix"),
-        ("__optimizer__", "optimizer runtime", "optimizer suffix"),
-        ("__score_judge__", "score runtime", "score suffix"),
+        (
+            "planner",
+            "You are the planner slot in a planner -> writer -> reviewer loop. Keep handoffs short, explicit, and easy for downstream slots to execute.",
+            "Compact handoff style: objective, constraints, next step.",
+        ),
+        (
+            "writer",
+            "You are the writer slot. Turn planning requests into concise execution-ready text and preserve the baton for reviewer.",
+            "Compact output style: deliverable plus one clean handoff.",
+        ),
+        (
+            "reviewer",
+            "You are the reviewer slot. Find the highest-value correction and keep the loop moving instead of reopening everything.",
+            "Compact review style: one correction, one approval state, one next step.",
+        ),
+        (
+            "__optimizer__",
+            "You optimize the three visible slots for concise cooperative baton-passing. Prefer minimal prompt changes that improve coordination.",
+            "When asked for a reprompt, emit only the reprompt block protocol.",
+        ),
+        (
+            "__score_judge__",
+            "You score the current collaboration quality from the runtime context that is visible to you.",
+            "When asked to score, output only `mean_score: <number>` and `note: <short text>`.",
+        ),
     ];
 
     let mut prefix_ids = BTreeMap::new();
@@ -313,15 +329,23 @@ async fn setup_program(db: &Database, stage_name: &str) -> Result<StageSetup> {
     for (slot, prompt) in [
         (
             "planner",
-            "planner prompt: keep coordination messages short and concrete.",
+            "Keep coordination messages short, factual, and easy for writer to act on in one pass.",
         ),
         (
             "writer",
-            "writer prompt: respond with compact execution-oriented text.",
+            "Convert incoming tasks into compact execution-oriented text and keep reviewer context aligned.",
         ),
         (
             "reviewer",
-            "reviewer prompt: be strict, concise, and cooperative with temporary tasks.",
+            "Review for the highest-value fix only, stay concise, and keep the loop cooperative.",
+        ),
+        (
+            "__optimizer__",
+            "Optimize planner, writer, and reviewer for concise stable handoffs. When asked for global reprompt, return valid reprompt blocks only.",
+        ),
+        (
+            "__score_judge__",
+            "Score overall collaboration quality from the current runtime context. When asked, output only `mean_score: <number>` and `note: <short text>`.",
         ),
     ] {
         let process_id = *slot_processes
@@ -357,7 +381,7 @@ async fn run_persistent_branch_task(
             task_sequence: vec![TaskStep {
                 action_name: "spawn_branch_process".to_string(),
                 action_args: json!({
-                    "task": "Generate one short branch note for the current runtime context.",
+                    "task": "Generate one compact writer-side branch note that cleanly continues the current baton-pass.",
                     "materialize_to_host": true
                 }),
             }],
@@ -366,16 +390,17 @@ async fn run_persistent_branch_task(
         })
         .await?;
 
-    flush_planner_mailbox(runtime, &setup.program_run_id, "persistent branch flush").await?;
-
-    wait_for_runtime_head_text(
+    wait_for_runtime_head_text_all(
         runtime,
         *setup
             .slot_processes
             .get("planner")
             .ok_or_else(|| anyhow!("missing planner process"))?,
-        "executed_action_name: spawn_branch_process",
-        Duration::from_secs(8),
+        &[
+            "[tool_executor_result]",
+            "executed_action_name: spawn_branch_process",
+        ],
+        TOOL_RESULT_TIMEOUT,
     )
     .await
 }
@@ -399,7 +424,7 @@ async fn run_ephemeral_clone_task(
             task_sequence: vec![TaskStep {
                 action_name: "spawn_branch_process".to_string(),
                 action_args: json!({
-                    "task": "Generate one short branch note for the current runtime context.",
+                    "task": "Generate one compact branch note for the current runtime context, but keep it inside the ephemeral clone only.",
                     "materialize_to_host": false
                 }),
             }],
@@ -407,8 +432,6 @@ async fn run_ephemeral_clone_task(
             metadata: None,
         })
         .await?;
-
-    flush_planner_mailbox(runtime, &setup.program_run_id, "ephemeral clone flush").await?;
 
     let planner_process_id = *setup
         .slot_processes
@@ -419,11 +442,14 @@ async fn run_ephemeral_clone_task(
         .get("writer")
         .ok_or_else(|| anyhow!("missing writer process"))?;
 
-    let seen = wait_for_runtime_head_text(
+    let seen = wait_for_runtime_head_text_all(
         runtime,
         planner_process_id,
-        "executed_action_name: spawn_branch_process",
-        Duration::from_secs(8),
+        &[
+            "[tool_executor_result]",
+            "executed_action_name: spawn_branch_process",
+        ],
+        TOOL_RESULT_TIMEOUT,
     )
     .await?;
     if !seen {
@@ -434,25 +460,102 @@ async fn run_ephemeral_clone_task(
     Ok(!runtime_head_contains(&writer_head, "[tool_executor_result]"))
 }
 
-async fn flush_planner_mailbox(runtime: &RuntimeEngine, program_run_id: &str, content: &str) -> Result<()> {
-    runtime
-        .send_message(SendMessageRequest {
-            sender: slot_target(program_run_id, "reviewer"),
-            target: slot_target(program_run_id, "planner"),
-            message_kind: MessageKind::NormalMessage,
-            base_priority: 4,
-            requested_delivery_action: DeliveryAction::SegmentBoundaryDeliver,
-            delay_ms: None,
-            result_target: ResultTarget::Sender,
-            explicit_result_target: None,
-            content: Some(content.to_string()),
-            content_ref: None,
-            task_sequence: Vec::new(),
-            hardware_sequence: Vec::new(),
-            metadata: None,
-        })
+async fn run_reprompt_replay(
+    db: &Database,
+    runtime: &RuntimeEngine,
+    setup: &StageSetup,
+    stage: StageSpec,
+) -> Result<ReplayObservation> {
+    let baseline_mean_score = if stage.measure_score_trend {
+        Some(runtime.debug_score_program_now(&setup.program_run_id).await?)
+    } else {
+        None
+    };
+    let mut delivery_probes = Vec::new();
+    let mut cycle_summaries = Vec::new();
+    let mut saw_reprompt_running = false;
+    let mut saw_empty_lengths_while_reprompt_running = false;
+    let mut final_phase = db
+        .get_program(&setup.program_run_id)
+        .await?
+        .plan_state_json
+        .global_phase;
+
+    for index in 0..stage.max_probe_messages {
+        let envelope = send_non_direct_probe(
+            runtime,
+            &setup.program_run_id,
+            stage.name,
+            index,
+            stage.long_message_repeat,
+        )
         .await?;
-    Ok(())
+        delivery_probes.push(json!({
+            "index": index,
+            "final_priority": envelope.final_priority,
+            "final_delivery_action": envelope.final_delivery_action.map(|value| value.as_str().to_string()),
+        }));
+
+        let reprompt_started =
+            wait_for_reprompt_start(db, &setup.program_run_id, REPROMPT_START_TIMEOUT).await?;
+        let phase = db
+            .get_program(&setup.program_run_id)
+            .await?
+            .plan_state_json
+            .global_phase;
+        println!("{} non-direct probe {} -> phase {}", stage.name, index, phase);
+
+        if !reprompt_started {
+            final_phase = phase;
+            sleep(Duration::from_millis(350)).await;
+            continue;
+        }
+
+        let cycle = wait_for_phase_cycle(db, &setup.program_run_id, true).await?;
+        saw_reprompt_running |= cycle.saw_reprompt_running;
+        saw_empty_lengths_while_reprompt_running |=
+            cycle.saw_empty_lengths_while_reprompt_running;
+        final_phase = cycle.final_phase.clone();
+
+        let score_after_cycle = if stage.measure_score_trend {
+            Some(runtime.debug_score_program_now(&setup.program_run_id).await?)
+        } else {
+            None
+        };
+        let cycle_index = cycle_summaries.len() + 1;
+        cycle_summaries.push(json!({
+            "cycle_index": cycle_index,
+            "trigger_probe_index": index,
+            "final_phase": cycle.final_phase,
+            "saw_empty_lengths_while_reprompt_running": cycle.saw_empty_lengths_while_reprompt_running,
+            "score_after_cycle": score_after_cycle,
+        }));
+
+        if cycle_summaries.len() >= stage.target_reprompt_cycles {
+            break;
+        }
+    }
+
+    let phase_observation = PhaseObservation {
+        saw_reprompt_running,
+        saw_empty_lengths_while_reprompt_running,
+        final_phase,
+    };
+    let post_reprompt_refill_seen = if phase_observation.saw_reprompt_running
+        && phase_observation.final_phase == "running"
+    {
+        refill_lengths_after_reprompt(db, runtime, setup).await?
+    } else {
+        false
+    };
+
+    Ok(ReplayObservation {
+        delivery_probes,
+        phase_observation,
+        reprompt_cycles: cycle_summaries,
+        post_reprompt_refill_seen,
+        baseline_mean_score,
+    })
 }
 
 async fn send_non_direct_probe(
@@ -534,6 +637,28 @@ async fn wait_for_phase_cycle(
             });
         }
 
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn wait_for_reprompt_start(
+    db: &Database,
+    program_run_id: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let start = Instant::now();
+    loop {
+        let phase = db
+            .get_program(program_run_id)
+            .await?
+            .plan_state_json
+            .global_phase;
+        if phase == "reprompt_running" {
+            return Ok(true);
+        }
+        if start.elapsed() > timeout {
+            return Ok(false);
+        }
         sleep(POLL_INTERVAL).await;
     }
 }
@@ -621,16 +746,19 @@ fn stringify_bindings(bindings: &BTreeMap<String, uuid::Uuid>) -> BTreeMap<Strin
         .collect()
 }
 
-async fn wait_for_runtime_head_text(
+async fn wait_for_runtime_head_text_all(
     runtime: &RuntimeEngine,
     process_id: uuid::Uuid,
-    needle: &str,
+    needles: &[&str],
     timeout: Duration,
 ) -> Result<bool> {
     let start = Instant::now();
     loop {
         let head = runtime.load_runtime_head(process_id).await?;
-        if runtime_head_contains(&head, needle) {
+        if needles
+            .iter()
+            .all(|needle| runtime_head_contains(&head, needle))
+        {
             return Ok(true);
         }
         if start.elapsed() > timeout {
@@ -648,6 +776,50 @@ fn runtime_head_contains(head: &form_zero::RuntimeHead, needle: &str) -> bool {
     head.full_context
         .iter()
         .any(|message| message.content.contains(needle))
+}
+
+fn summarize_scores(baseline_mean_score: Option<f64>, reprompt_cycles: &[Value]) -> Value {
+    let cycle_scores = reprompt_cycles
+        .iter()
+        .filter_map(|cycle| cycle.get("score_after_cycle").and_then(Value::as_f64))
+        .collect::<Vec<_>>();
+    let first_cycle_mean_score = cycle_scores.first().copied();
+    let last_cycle_mean_score = cycle_scores.last().copied();
+    let delta_last_vs_first_cycle = first_cycle_mean_score.zip(last_cycle_mean_score).map(
+        |(first, last)| last - first,
+    );
+    let delta_last_vs_baseline = baseline_mean_score.zip(last_cycle_mean_score).map(
+        |(baseline, last)| last - baseline,
+    );
+    let first_five_average = average(&cycle_scores.iter().copied().take(5).collect::<Vec<_>>());
+    let last_five_average = if cycle_scores.len() >= 5 {
+        average(&cycle_scores[cycle_scores.len() - 5..])
+    } else {
+        average(&cycle_scores)
+    };
+
+    json!({
+        "baseline_mean_score": baseline_mean_score,
+        "per_cycle_mean_scores": cycle_scores,
+        "first_cycle_mean_score": first_cycle_mean_score,
+        "last_cycle_mean_score": last_cycle_mean_score,
+        "delta_last_vs_first_cycle": delta_last_vs_first_cycle,
+        "delta_last_vs_baseline": delta_last_vs_baseline,
+        "first_five_average": first_five_average,
+        "last_five_average": last_five_average,
+        "improved_last_vs_first_cycle": delta_last_vs_first_cycle.map(|delta| delta > 0.0),
+        "improved_last_five_vs_first_five": first_five_average
+            .zip(last_five_average)
+            .map(|(first, last)| last > first),
+    })
+}
+
+fn average(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
 }
 
 fn slot_target(program_run_id: &str, slot_name: &str) -> TargetSelector {

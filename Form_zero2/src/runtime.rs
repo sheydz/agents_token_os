@@ -2958,6 +2958,12 @@ impl RuntimeEngine {
         self.control_queue.resolve_slot(target).await
     }
 
+    pub async fn debug_score_program_now(&self, program_run_id: &str) -> Result<f64> {
+        let score_text = self.run_score_judge_task_shot_text(program_run_id).await?;
+        parse_mean_score(&score_text)
+            .with_context(|| format!("score_judge returned unparseable output: {score_text:?}"))
+    }
+
     fn start_control_worker(&self, mut rx: mpsc::UnboundedReceiver<RuntimeControlCommand>) {
         let runtime = self.clone();
         tokio::spawn(async move {
@@ -3715,11 +3721,23 @@ impl RuntimeEngine {
     }
 
     async fn run_score_judge_task_shot(&self, program_run_id: &str) -> Result<f64> {
+        let optimizer = self
+            .resolve_hidden_process(program_run_id, HIDDEN_OPTIMIZER_SLOT_NAME)
+            .await?;
         let score_judge = self
             .resolve_hidden_process(program_run_id, HIDDEN_SCORE_JUDGE_SLOT_NAME)
             .await?;
-        let optimizer = self
-            .resolve_hidden_process(program_run_id, HIDDEN_OPTIMIZER_SLOT_NAME)
+        let score_text = self.run_score_judge_task_shot_text(program_run_id).await?;
+        let mean_score = parse_mean_score(&score_text)
+            .with_context(|| format!("score_judge returned unparseable output: {score_text:?}"))?;
+        self.dispatch_system_message_direct(&score_judge, &optimizer, "score_update", score_text)
+            .await?;
+        Ok(mean_score)
+    }
+
+    async fn run_score_judge_task_shot_text(&self, program_run_id: &str) -> Result<String> {
+        let score_judge = self
+            .resolve_hidden_process(program_run_id, HIDDEN_SCORE_JUDGE_SLOT_NAME)
             .await?;
         let snapshot_runtime_head = resident_runtime_head(
             &self.db,
@@ -3728,21 +3746,15 @@ impl RuntimeEngine {
             score_judge.process.id,
         )
         .await?;
-        let score_text = self
-            .run_task_shot(
-                TaskShotKind::ScoreJudge,
-                &score_judge,
-                &snapshot_runtime_head,
-                ProviderMessage::user(
-                    "Please score the current task's known message network from your runtime head. Output only two lines: `mean_score: <number>` and `note: <short text>`.",
-                ),
-            )
-            .await?;
-        let mean_score = parse_mean_score(&score_text)
-            .with_context(|| format!("score_judge returned unparseable output: {score_text:?}"))?;
-        self.dispatch_system_message_direct(&score_judge, &optimizer, "score_update", score_text)
-            .await?;
-        Ok(mean_score)
+        self.run_task_shot(
+            TaskShotKind::ScoreJudge,
+            &score_judge,
+            &snapshot_runtime_head,
+            ProviderMessage::user(
+                "Please score the current task's known message network from your runtime head. Output only two lines: `mean_score: <number>` and `note: <short text>`.",
+            ),
+        )
+        .await
     }
 
     async fn run_hidden_process_generation(
@@ -4971,7 +4983,10 @@ impl RuntimeEngine {
                 result_metadata,
             )
             .await?;
-        self.global_message_queue.enqueue(envelope)?;
+        self.dispatch_prepared_envelope(&target, envelope)?;
+        self.queue_dispatcher
+            .release_for_process(target.process.id)
+            .await;
         Ok(())
     }
 
