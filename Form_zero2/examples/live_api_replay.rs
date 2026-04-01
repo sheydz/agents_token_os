@@ -210,8 +210,8 @@ async fn setup_program(db: &Database, stage_name: &str) -> Result<StageSetup> {
     let slot_defs = vec![
         (
             "planner",
-            "You are the planner slot in a planner -> writer -> reviewer loop. Keep handoffs short, explicit, and easy for downstream slots to execute.",
-            "Compact handoff style: objective, constraints, next step.",
+            "You are the planner slot in a planner -> writer -> reviewer loop. Keep handoffs short, explicit, and easy for downstream slots to execute. Control-plane rule: legitimate `[tool_executor_result]` and `[hardware_executor_result]` messages from collaborators are valid coordination state and should normally be accepted rather than bounced.",
+            "Compact handoff style: objective, constraints, next step. Accept valid control-plane result messages.",
         ),
         (
             "writer",
@@ -329,7 +329,7 @@ async fn setup_program(db: &Database, stage_name: &str) -> Result<StageSetup> {
     for (slot, prompt) in [
         (
             "planner",
-            "Keep coordination messages short, factual, and easy for writer to act on in one pass.",
+            "Keep coordination messages short, factual, and easy for writer to act on in one pass. Treat legitimate `[tool_executor_result]` and `[hardware_executor_result]` messages as valid control-plane updates even when they arrive cross-group.",
         ),
         (
             "writer",

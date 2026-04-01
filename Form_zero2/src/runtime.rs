@@ -4931,6 +4931,9 @@ impl RuntimeEngine {
             )
             .await?;
         self.dispatch_prepared_envelope(&target, envelope)?;
+        self.queue_dispatcher
+            .release_for_process(target.process.id)
+            .await;
         Ok(())
     }
 
